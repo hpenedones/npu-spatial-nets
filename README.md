@@ -8,83 +8,107 @@ physical compute tiles and wiring them together with hardware data streams.
 
 The goal: design a neural network architecture that maps **exactly** to the
 NPU's 2D tile array and demonstrate inference throughput approaching the
-chip's theoretical **50 TOPS** (INT8) peak — orders of magnitude faster than
-CPU execution of the same network.
+chip's theoretical **25 TFLOPS** (bfloat16) peak — orders of magnitude faster
+than CPU execution of the same network. The network can be any architecture
+with learnable parameters and non-linearities — we design the network to
+match the hardware, not the other way around.
 
 ## The Hardware
 
 The XDNA 2 NPU in the Ryzen AI 9 HX 370 is a **spatial dataflow computer**:
 
 ```
-        Col 0    Col 1    Col 2    Col 3    Col 4    Col 5    Col 6    Col 7
-       ┌────────┬────────┬────────┬────────┬────────┬────────┬────────┬────────┐
-Row 3  │ Tile   │ Tile   │ Tile   │ Tile   │ Tile   │ Tile   │ Tile   │ Tile   │
-       │ (0,3)  │ (1,3)  │ (2,3)  │ (3,3)  │ (4,3)  │ (5,3)  │ (6,3)  │ (7,3)  │
-       ├────────┼────────┼────────┼────────┼────────┼────────┼────────┼────────┤
-Row 2  │ Tile   │ Tile   │ Tile   │ Tile   │ Tile   │ Tile   │ Tile   │ Tile   │
-       │ (0,2)  │ (1,2)  │ (2,2)  │ (3,2)  │ (4,2)  │ (5,2)  │ (6,2)  │ (7,2)  │
-       ├────────┼────────┼────────┼────────┼────────┼────────┼────────┼────────┤
-Row 1  │ Tile   │ Tile   │ Tile   │ Tile   │ Tile   │ Tile   │ Tile   │ Tile   │
-       │ (0,1)  │ (1,1)  │ (2,1)  │ (3,1)  │ (4,1)  │ (5,1)  │ (6,1)  │ (7,1)  │
-       ├────────┼────────┼────────┼────────┼────────┼────────┼────────┼────────┤
-Row 0  │ Tile   │ Tile   │ Tile   │ Tile   │ Tile   │ Tile   │ Tile   │ Tile   │
-       │ (0,0)  │ (1,0)  │ (2,0)  │ (3,0)  │ (4,0)  │ (5,0)  │ (6,0)  │ (7,0)  │
-       └────────┴────────┴────────┴────────┴────────┴────────┴────────┴────────┘
-         Mem 0    Mem 1    Mem 2    Mem 3    Mem 4    Mem 5    Mem 6    Mem 7
-                                   (L2 Memory Tiles — 4 MB total)
+         Col 0    Col 1    Col 2    Col 3    Col 4    Col 5    Col 6    Col 7
+        ┌────────┬────────┬────────┬────────┬────────┬────────┬────────┬────────┐
+Row 5   │Compute │Compute │Compute │Compute │Compute │Compute │Compute │Compute │
+        │ Tile   │ Tile   │ Tile   │ Tile   │ Tile   │ Tile   │ Tile   │ Tile   │
+        ├────────┼────────┼────────┼────────┼────────┼────────┼────────┼────────┤
+Row 4   │Compute │Compute │Compute │Compute │Compute │Compute │Compute │Compute │
+        │ Tile   │ Tile   │ Tile   │ Tile   │ Tile   │ Tile   │ Tile   │ Tile   │
+        ├────────┼────────┼────────┼────────┼────────┼────────┼────────┼────────┤
+Row 3   │Compute │Compute │Compute │Compute │Compute │Compute │Compute │Compute │
+        │ Tile   │ Tile   │ Tile   │ Tile   │ Tile   │ Tile   │ Tile   │ Tile   │
+        ├────────┼────────┼────────┼────────┼────────┼────────┼────────┼────────┤
+Row 2   │Compute │Compute │Compute │Compute │Compute │Compute │Compute │Compute │
+        │ Tile   │ Tile   │ Tile   │ Tile   │ Tile   │ Tile   │ Tile   │ Tile   │
+        ├────────┼────────┼────────┼────────┼────────┼────────┼────────┼────────┤
+Row 1   │MemTile │MemTile │MemTile │MemTile │MemTile │MemTile │MemTile │MemTile │
+        │ 512 KB │ 512 KB │ 512 KB │ 512 KB │ 512 KB │ 512 KB │ 512 KB │ 512 KB │
+        ├────────┼────────┼────────┼────────┼────────┼────────┼────────┼────────┤
+Row 0   │  Shim  │  Shim  │  Shim  │  Shim  │  Shim  │  Shim  │  Shim  │  Shim  │
+        │  (DMA) │  (DMA) │  (DMA) │  (DMA) │  (DMA) │  (DMA) │  (DMA) │  (DMA) │
+        └────────┴────────┴────────┴────────┴────────┴────────┴────────┴────────┘
 ```
 
 | Property | Value |
 |---|---|
-| Compute tiles | 32 (8 columns × 4 rows) |
-| Per-tile SRAM | ~48 KB |
-| Per-tile compute | 512 INT8 MACs/cycle (VLIW+SIMD) |
+| Compute tiles | 32 (8 columns × 4 rows, rows 2–5) |
+| Memory tiles | 8 (row 1, 512 KB each, 4 MB total) |
+| Shim tiles | 8 (row 0, DMA interface to host DDR) |
+| Per-tile SRAM | ~64 KB data memory |
+| Per-tile compute | bf16 MMUL unit (VLIW+SIMD) |
 | Clock | ~1.5 GHz |
-| Peak throughput | **50 TOPS** (INT8), ~25 TFLOPS (BF16) |
-| Achieved (GEMM) | ~38 TOPS INT8 (76% efficiency) |
-| L2 memory | 4 MB (8 memory tiles, one per column) |
-| Interconnect | N/S/E/W nearest-neighbor stream switches |
+| Peak throughput | **25 TFLOPS** (bfloat16) |
+| Interconnect | ObjectFIFOs — depth-2 double-buffered tile-to-tile streams |
 | Power | ~6 W |
 
-Each tile is an independent processor with its own local memory and direct
-hardware data links to its four neighbors. Data moves tile-to-tile through
-programmable stream switches — no shared bus, no cache hierarchy, no
-contention.
+## Phase 1 Results: Peak Throughput Benchmark
 
-## The Concept: Spatial Pipelining
+Single large GEMM benchmark (bfloat16) using IRON's AIEGEMM operator:
 
-Instead of running a neural network layer-by-layer on a single processor
-(temporal computing), we **spread the network across the physical tile array**
-so all tiles compute simultaneously:
+| Configuration | NPU Latency | NPU TFLOPS | CPU TFLOPS | Speedup |
+|---|---|---|---|---|
+| 2048³, 1 column | 48.1 ms | 0.36 | — | — |
+| 2048³, 2 columns | 26.4 ms | 0.65 | — | — |
+| 2048³, 8 columns | 7.2 ms | **2.38** | 1.83 | 1.3× |
+| 4096³, 8 columns | 55.1 ms | **2.49** | 1.83 | 1.4× |
+
+**Peak NPU: 2.49 TFLOPS** (10% of theoretical 25 TFLOPS). The modest speedup
+over CPU for a single large GEMM is because the operation is **memory-bandwidth
+limited** — data must stream from DDR through memory tiles into compute tiles.
+
+**Key insight**: The NPU wins when data **stays on-chip** between operations.
+A spatial pipeline avoids DDR round-trips — this is where massive speedup
+should come from.
+
+## Phase 2: Spatial Pipeline MLP (in progress)
+
+### Architecture: 4-Stage Pipelined MLP × 8 Parallel Pipelines
+
+A 4-layer MLP mapped to the 4×8 compute tile grid. Each tile runs one fused
+matmul+ReLU layer; data flows through ObjectFIFOs and never returns to DDR:
 
 ```
-Input → [Col 0: Layer 1] → [Col 1: Layer 2] → ... → [Col 7: Layer 8] → Output
-          (4 tiles)          (4 tiles)                  (4 tiles)
-
-         Each column: 4 tiles cooperate on one layer (data-parallel split)
-         Between columns: ObjectFIFO hardware streams carry activations
+Column 0        Column 1        ...  Column 7
+(pipeline 0)    (pipeline 1)         (pipeline 7)
+┌───────────┐   ┌───────────┐        ┌───────────┐
+│ Row 2     │   │ Row 2     │        │ Row 2     │
+│ MatMul₁   │   │ MatMul₁   │   ...  │ MatMul₁   │  Stage 1
+│ + ReLU    │   │ + ReLU    │        │ + ReLU    │
+├───────────┤   ├───────────┤        ├───────────┤
+│ Row 3     │   │ Row 3     │        │ Row 3     │
+│ MatMul₂   │   │ MatMul₂   │   ...  │ MatMul₂   │  Stage 2
+│ + ReLU    │   │ + ReLU    │        │ + ReLU    │
+├───────────┤   ├───────────┤        ├───────────┤
+│ Row 4     │   │ Row 4     │        │ Row 4     │
+│ MatMul₃   │   │ MatMul₃   │   ...  │ MatMul₃   │  Stage 3
+│ + ReLU    │   │ + ReLU    │        │ + ReLU    │
+├───────────┤   ├───────────┤        ├───────────┤
+│ Row 5     │   │ Row 5     │        │ Row 5     │
+│ MatMul₄   │   │ MatMul₄   │   ...  │ MatMul₄   │  Stage 4
+│ (output)  │   │ (output)  │        │ (output)  │
+└───────────┘   └───────────┘        └───────────┘
+    ↑               ↑                     ↑
+  input₀          input₁              input₇
 ```
 
-- **8 pipeline stages** = 8 columns, one neural network layer per column
-- **4-way data parallelism** = 4 rows per column, each tile processes a
-  slice of the layer's computation
-- **Weights in tile-local SRAM** — no DDR access during inference
-- **INT8 arithmetic** — maximizes throughput at 512 MACs/cycle/tile
-- **ObjectFIFOs** — hardware ring buffers for zero-copy inter-tile streaming
-
-Once the pipeline is full, one inference result exits **every pipeline
-cycle** — all 32 tiles are active, all interconnects are carrying data.
+- **8 columns** = 8 independent pipelines (same weights, different samples)
+- **4 rows** = 4 pipeline stages (one MLP layer each)
+- **Hidden dim** = 128 (weights 32 KB, fits in 64 KB tile SRAM)
+- **Batch** = 16 per pipeline (4 KB I/O buffers, double-buffered)
+- **Total parameters**: 4 × 128² = 65,536 (learnable, with ReLU non-linearities)
 
 ## Toolchain
-
-This project uses the **IRON** Python API — the close-to-metal programming
-model for AMD AIE tiles. IRON compiles to MLIR-AIE, then to per-tile ELF
-binaries, and loads them onto the NPU via XRT.
-
-**This is NOT the Vitis AI / ONNX Runtime path.** Vitis AI treats the NPU as
-a black box and doesn't give tile-level control. IRON gives full explicit
-control over tile placement, data movement, buffer sizes, and kernel code —
-which is what we need for true spatial pipelining.
 
 | Component | Role |
 |---|---|
@@ -95,34 +119,25 @@ which is what we need for true spatial pipelining.
 
 ## Project Phases
 
-- [ ] **Phase 0 — Toolchain Setup**: Install IRON/MLIR-AIE, verify NPU access,
-  run a minimal passthrough example end-to-end.
-- [ ] **Phase 1 — Peak Throughput**: Run whole-array INT8 matrix multiplication
-  on all 32 tiles. Measure TOPS vs theoretical peak.
-- [ ] **Phase 2 — Spatial Neural Network**: Design and implement an 8-layer
-  pipelined MLP mapped to the 8×4 tile grid.
-- [ ] **Phase 3 — Benchmark**: Compare NPU inference latency/throughput against
-  CPU (and GPU). Quantify speedup.
-- [ ] **Phase 4 — Training & Applications**: Explore backpropagation on NPU
-  tiles. Pick a real ML task (time-series, FEM, signal processing).
+- [x] **Phase 0 — Toolchain Setup**: IRON installed, AXPY/GEMM/RELU tests all pass.
+- [x] **Phase 1 — Peak Throughput**: GEMM benchmark on all 8 columns.
+  Peak: 2.49 TFLOPS bf16 (10% of theoretical).
+- [ ] **Phase 2 — Spatial Pipeline MLP**: 4-layer pipelined MLP on 4×8 grid.
+  Template: MHA operator (working 3-stage spatial pipeline in IRON).
+- [ ] **Phase 3 — Benchmark**: NPU vs CPU speedup. Target: 100–1000×.
+- [ ] **Phase 4 — Training & Applications**: Backprop on NPU, pick real ML task.
 
 ## Hardware Requirements
 
 - **Processor**: AMD Ryzen AI 9 HX 370 (or any XDNA 2 / Strix Point APU)
 - **OS**: Linux, kernel 6.11+ with `amdxdna` driver
 - **NPU device**: `/dev/accel/accel0` must be accessible
-- **NPU firmware**: `/lib/firmware/amdnpu/`
 - **Runtime**: XRT (built from [xdna-driver](https://github.com/amd/xdna-driver))
-
-See [fastflowlm-docker](https://github.com/hpenedones/fastflowlm-docker) for
-a working Docker-based NPU setup on this hardware.
 
 ## References
 
 - [IRON repo](https://github.com/amd/IRON) — close-to-metal NPU programming
 - [MLIR-AIE programming guide](https://github.com/Xilinx/mlir-aie/tree/main/programming_guide)
-- [Whole-array matmul example](https://github.com/Xilinx/mlir-aie/tree/main/programming_examples/basic/matrix_multiplication/whole_array)
-- [GEMM optimization on XDNA (arXiv)](https://arxiv.org/html/2512.13282v1) — achieved ~38 TOPS
 - [NPU training (arXiv)](https://arxiv.org/html/2504.03083v1) — backprop on AIE tiles
 - [Linux kernel NPU docs](https://docs.kernel.org/accel/amdxdna/amdnpu.html)
 - [IRON tutorial (IPDPS 2025)](https://www.amd.com/content/dam/amd/en/documents/products/processors/ryzen/ai/iron-for-ryzen-ai-tutorial-ipdps-2025.pdf)
