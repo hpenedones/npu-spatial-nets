@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """
-AIE operator class for the Spatial MLP pipeline.
-Handles compilation artifacts, runtime buffer management, and kernel invocation.
+AIE operator class for the Recurrent MLP.
 
-Uses IRON's proven mm.cc for matmul (tiled layout) + custom relu_inplace.cc.
+Up to 32 compute tiles (4 rows x 8 columns), each with weight held in SRAM.
+Hardware loop applies ReLU(x @ W) for num_iters iterations on-chip.
 """
 
 from pathlib import Path
@@ -22,72 +22,34 @@ from iron.common import (
 )
 
 
-class AIESpatialMLP(AIEOperatorBase):
-    """
-    4-layer pipelined MLP running on all 32 AIE tiles.
+class AIERecurrentMLP(AIEOperatorBase):
 
-    Architecture:
-      - 4 rows (pipeline stages) × 8 columns (parallel pipelines)
-      - Each tile: zero → matmul → relu_inplace (proven IRON kernel pattern)
-      - Data flows through ObjectFIFOs, never returns to DDR between layers
-      - Data is in tiled (blocked) layout: 8×8 blocks for bf16 with BFP16 emulation
-    """
-
-    def __init__(
-        self,
-        H: int = 128,
-        B: int = 16,
-        num_layers: int = 4,
-        num_pipelines: int = 8,
-        num_batches: int = 1,
-        context=None,
-    ):
+    def __init__(self, H=128, B=16, num_tiles=24, num_iters=1000, context=None):
         self.H = H
         self.B = B
-        self.num_layers = num_layers
-        self.num_pipelines = num_pipelines
-        self.num_batches = num_batches
-
+        self.num_tiles = num_tiles
+        self.num_iters = num_iters
         self.xclbin_artifact = None
         self.insts_artifact = None
-
         AIEOperatorBase.__init__(self, context=context)
 
     def set_up_artifacts(self):
-        project_dir = Path(__file__).parent.parent  # npu-spatial-nets/
-        operator_dir = Path(__file__).parent  # spatial_mlp/
-        iron_dir = Path(self.context.base_dir)  # IRON/
+        project_dir = Path(__file__).parent.parent
+        operator_dir = Path(__file__).parent
+        iron_dir = Path(self.context.base_dir)
 
-        name = (f"spatial_mlp_{self.H}h_{self.B}b_"
-                f"{self.num_layers}l_{self.num_pipelines}p")
+        name = f"recurrent_mlp_{self.H}h_{self.B}b_{self.num_tiles}t_{self.num_iters}i"
 
-        # Source files: IRON's mm.cc + our relu_inplace.cc
         mm_source = str(iron_dir / "aie_kernels" / "aie2p" / "mm.cc")
         relu_source = str(project_dir / "aie_kernels" / "mlp_kernels.cc")
-
-        # mm.cc compile flags: set tile dimensions and bf16 type
-        mm_defines = [
-            f"-DDIM_M={self.B}",
-            f"-DDIM_K={self.H}",
-            f"-DDIM_N={self.H}",
-            "-Dbf16_bf16_ONLY",
-            "-DAIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16",
-        ]
-
-        relu_defines = [
-            "-DAIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16",
-        ]
 
         mlir_artifact = PythonGeneratedMLIRArtifact.new(
             f"{name}.mlir",
             import_path=operator_dir / "design.py",
-            callback_fn="spatial_mlp",
+            callback_fn="recurrent_mlp",
             callback_kwargs={
-                "H": self.H,
-                "B": self.B,
-                "num_layers": self.num_layers,
-                "num_pipelines": self.num_pipelines,
-                "num_batches": self.num_batches,
+                "H": self.H, "B": self.B,
+                "num_tiles": self.num_tiles, "num_iters": self.num_iters,
             },
         )
 
@@ -100,12 +62,16 @@ class AIESpatialMLP(AIEOperatorBase):
                     depends=[
                         KernelObjectArtifact.new(
                             "mlp_mm.o",
-                            extra_flags=mm_defines,
+                            extra_flags=[
+                                f"-DDIM_M={self.B}", f"-DDIM_K={self.H}",
+                                f"-DDIM_N={self.H}", "-Dbf16_bf16_ONLY",
+                                "-DAIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16",
+                            ],
                             depends=[SourceArtifact.new(mm_source)],
                         ),
                         KernelObjectArtifact.new(
                             "mlp_relu.o",
-                            extra_flags=relu_defines,
+                            extra_flags=["-DAIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16"],
                             depends=[SourceArtifact.new(relu_source)],
                         ),
                     ],
@@ -125,24 +91,12 @@ class AIESpatialMLP(AIEOperatorBase):
         self.add_artifacts([xclbin_artifact, insts_artifact])
 
     def set_up_runtime(self):
-        H, B = self.H, self.B
-        np_ = self.num_pipelines
-        nl = self.num_layers
-
+        H, B, nt = self.H, self.B, self.num_tiles
         self.add_kernel(
-            "mlp",
-            self.xclbin_artifact,
-            self.xclbin_artifact.kernel_name,
-            self.insts_artifact,
+            "recurrent", self.xclbin_artifact,
+            self.xclbin_artifact.kernel_name, self.insts_artifact,
         )
-
-        # add_buffer(name, count, dtype=bfloat16) — count is element count
-        input_count = np_ * B * H
-        weights_count = nl * H * H
-        output_count = np_ * B * H
-
-        self.add_buffer("input", input_count)
-        self.add_buffer("weights", weights_count)
-        self.add_buffer("output", output_count)
-
-        self.add_to_runlist("mlp", "input", "weights", "output")
+        self.add_buffer("input", nt * B * H)
+        self.add_buffer("weights", H * H)
+        self.add_buffer("output", nt * B * H)
+        self.add_to_runlist("recurrent", "input", "weights", "output")

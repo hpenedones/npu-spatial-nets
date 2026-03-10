@@ -54,6 +54,8 @@ Row 0   │  Shim  │  Shim  │  Shim  │  Shim  │  Shim  │  Shim  │  S
 
 ## Phase 1 Results: Peak Throughput Benchmark
 
+*(Code removed during simplification; results preserved for context.)*
+
 Single large GEMM benchmark (bfloat16) using IRON's AIEGEMM operator:
 
 | Configuration | NPU Latency | NPU TFLOPS | CPU TFLOPS | Speedup |
@@ -72,6 +74,8 @@ A spatial pipeline avoids DDR round-trips — this is where massive speedup
 should come from.
 
 ## Phase 2 Results: Spatial Pipeline MLP
+
+*(Code removed during simplification; results preserved for context.)*
 
 ### Architecture: 4-Stage Pipelined MLP × 8 Parallel Pipelines
 
@@ -138,88 +142,79 @@ per-invocation overhead. For the NPU to show advantage, compute must dominate
 overhead. The Phase 1 GEMM benchmark confirms this: a 4096³ matmul (137B FLOPs)
 achieves 2.49 TFLOPS because compute (55 ms) >> overhead (~0.1 ms).
 
-### What's Next
-
-To demonstrate meaningful speedup, we need to increase compute per invocation:
-1. **INT8 kernels**: 50 TOPS peak (2× bf16), weights half the size → H=256 could fit
-2. **Memory tile staging**: Use 512 KB memory tiles to double-buffer larger weight
-   matrices, allowing H>128 while keeping tile SRAM within budget
-3. **Multi-batch streaming**: Process hundreds of batches per invocation to
-   amortize the ~126 µs overhead across more useful compute
-4. **Larger pipeline**: Chain more operations (e.g., attention + MLP) to
-   increase on-chip compute before touching DDR
+**Lesson learned**: for the NPU to win, compute per invocation must vastly
+exceed the ~120 µs driver overhead. This motivated Phase 3's on-chip looping.
 
 ## Phase 3 Results: Recurrent MLP (On-Chip Loop) 🎉
 
 ### Architecture: Hardware-Looped Single-Weight Recurrent Network
 
 A recurrent MLP that applies the same weight matrix in a tight hardware loop,
-keeping all activations in tile SRAM throughout. This finally amortizes the
-~120 µs per-invocation overhead:
+keeping all activations in tile SRAM throughout. This amortizes the ~120 µs
+per-invocation overhead across thousands of on-chip compute steps:
 
 ```
                    Column 0        Column 1        ...  Column 7
-                  (pipeline 0)    (pipeline 1)         (pipeline 7)
 DDR → Input  →   ┌───────────┐   ┌───────────┐        ┌───────────┐
-                  │ Compute   │   │ Compute   │        │ Compute   │
-                  │ Tile      │   │ Tile      │   ...  │ Tile      │
-                  │           │   │           │        │           │
-                  │  W held   │   │  W held   │        │  W held   │
-                  │  in SRAM  │   │  in SRAM  │        │  in SRAM  │
-                  │           │   │           │        │           │
-                  │ ┌───┐     │   │ ┌───┐     │        │ ┌───┐     │
-                  │ │ A │←──┐ │   │ │ A │←──┐ │        │ │ A │←──┐ │
-                  │ └───┘   │ │   │ └───┘   │ │        │ └───┘   │ │
-                  │   ↓  hw │ │   │   ↓  hw │ │        │   ↓  hw │ │
-                  │ ReLU loop│ │   │ ReLU loop│ │  ...  │ ReLU loop│ │
-                  │ (xW)    │ │   │ (xW)    │ │        │ (xW)    │ │
-                  │   ↓     │ │   │   ↓     │ │        │   ↓     │ │
-                  │ ┌───┐   │ │   │ ┌───┐   │ │        │ ┌───┐   │ │
-                  │ │ B │───┘ │   │ │ B │───┘ │        │ │ B │───┘ │
-                  │ └───┘     │   │ └───┘     │        │ └───┘     │
+                  │ Row 2     │   │ Row 2     │        │ Row 2     │
+                  │  W in SRAM│   │  W in SRAM│   ...  │  W in SRAM│
+                  │ [A↔B loop]│   │ [A↔B loop]│        │ [A↔B loop]│
+                  ├───────────┤   ├───────────┤        ├───────────┤
+                  │ Row 3     │   │ Row 3     │        │ Row 3     │
+                  │  W in SRAM│   │  W in SRAM│   ...  │  W in SRAM│
+                  │ [A↔B loop]│   │ [A↔B loop]│        │ [A↔B loop]│
+                  ├───────────┤   ├───────────┤        ├───────────┤
+                  │ Row 4     │   │ Row 4     │        │ Row 4     │
+                  │  W in SRAM│   │  W in SRAM│   ...  │  W in SRAM│
+                  │ [A↔B loop]│   │ [A↔B loop]│        │ [A↔B loop]│
                   └───────────┘   └───────────┘        └───────────┘
 DDR ← Output ←        ↑               ↑                     ↑
+                     MemTile split/forward/join (row 1)
 ```
 
 **Key design decisions:**
+- **24 tiles** across 3 rows × 8 columns (max before MemTile routing saturates)
 - **Single weight** loaded once from DDR, held in SRAM for entire execution
 - **Hardware loop** (`scf.for` via `range_()`) — constant instruction size, arbitrary depth
 - **Ping-pong** between buffers A and B: each loop iteration does A→B then B→A
 - **No FIFO operations inside the loop** — avoids the deadlock that blocked earlier designs
+- **MemTile data routing** for multi-row: `split()` for inputs, `forward()` for weights, `join()` for outputs
 - **Effective depth** = 2 × `num_iters` (two matmul+ReLU per loop body)
 
 ### Benchmark Results
 
-8 compute tiles, H=128, B=16 per tile (128 total samples), bfloat16:
+24 compute tiles (3 rows × 8 columns), H=128, B=16/tile (384 total samples), bfloat16:
 
-| Depth | NPU Latency | NPU GFLOPS | CPU GFLOPS | Speedup |
-|---|---|---|---|---|
-| 10 (5 iters) | 0.12 ms | 355 | 158 | **2.2×** |
-| 100 (50 iters) | 0.25 ms | 1,682 | 231 | **7.3×** |
-| 1,000 (500 iters) | 1.49 ms | 2,823 | 239 | **11.8×** |
-| 2,000 (1000 iters) | 2.83 ms | **2,967** | 204 | **14.6×** |
-| 10,000 (5000 iters) | 13.63 ms | **3,077** | 226 | **13.7×** |
-| 20,000 (10000 iters) | 27.04 ms | **3,102** | 234 | **13.3×** |
+| Tiles | Depth | NPU Latency | NPU TFLOPS | CPU GFLOPS | Speedup |
+|---|---|---|---|---|---|
+| 8 (1 row) | 1,000 | 1.45 ms | **2.89** | 237 | **12.2×** |
+| 16 (2 rows) | 1,000 | 1.46 ms | **5.74** | 354 | **16.2×** |
+| 24 (3 rows) | 1,000 | 1.46 ms | **8.63** | 429 | **20.1×** |
+| 24 (3 rows) | 10,000 | 14.05 ms | **8.95** | 439 | **20.4×** |
 
-**Peak NPU throughput: 3.1 TFLOPS** (12.4% of 25 TFLOPS theoretical).
+**Peak NPU throughput: 8.95 TFLOPS** (35.8% of 25 TFLOPS theoretical).
 
-### Analysis
+### Scaling Analysis
 
 ```
-Per-step latency: ~1.35 µs (matmul + ReLU per tile)
-Per-tile throughput: 388 GFLOPS (50% of ~780 GFLOPS single-tile peak)
-Invocation overhead: ~120 µs (amortized over many steps)
+Per-tile throughput:  ~360 GFLOPS (consistent across 8, 16, 24 tiles)
+Total NPU latency:   ~1.46 ms (constant — all tiles run in parallel!)
+Invocation overhead:  ~120 µs (amortized at depth ≥ 1000)
 
-Depth=10:    overhead dominates, modest 2.2× speedup
-Depth=1000:  compute dominates, 11.8× speedup at 2.8 TFLOPS
-Depth=10000: near-asymptotic, 13.3× speedup at 3.1 TFLOPS
+8  tiles × 360 GFLOPS/tile =  2.9 TFLOPS  ✓
+16 tiles × 360 GFLOPS/tile =  5.7 TFLOPS  ✓  (near-linear scaling)
+24 tiles × 360 GFLOPS/tile =  8.6 TFLOPS  ✓  (near-linear scaling)
 ```
 
-The remaining gap to 25 TFLOPS (we achieve 12.4%) has several causes:
-- Only using **8 of 32 tiles** (row 2 only, not all 4 rows)
-- The `zero_bf16` call before each matmul wastes cycles
-- The `copy_bf16` call at the end adds latency
-- Memory tile relay overhead for weight loading
+**Why 24 tiles, not 32?** Each MemTile has ~6 master ports northward.
+Our design needs 3 per row (weight + input + output). At 3 rows = 9 data
+paths per MemTile, which fits; at 4 rows = 12 paths, the router fails.
+
+**Remaining gap to 25 TFLOPS** (we achieve 36%):
+- Theoretical per-tile peak: ~768 GFLOPS; we get ~360 (47% utilization)
+- The `zero_bf16` call before each matmul wastes ~12% of step time
+- Using only 24 of 32 tiles (75% array utilization)
+- A fused C=A×B kernel (vs current C+=A×B with separate zero) would reach ~735 GFLOPS/tile
 
 The NPU **strongly wins** vs CPU for deep recurrent computations because:
 - CPU: every 128×128 matmul bounces through L1/L2/L3 cache hierarchy
@@ -242,7 +237,8 @@ The NPU **strongly wins** vs CPU for deep recurrent computations because:
 - [x] **Phase 2 — Spatial Pipeline MLP**: 4-layer pipelined MLP on 4×8 grid.
   All 32 tiles active, correct results, but overhead-dominated at H=128.
 - [x] **Phase 3 — Recurrent MLP (On-Chip Loop)**: Single weight, hardware loop.
-  **3.1 TFLOPS, 14× speedup over CPU** at depth 2000+.
+  24 tiles (3 rows × 8 columns) via MemTile split/forward/join.
+  **8.95 TFLOPS, 20× speedup over CPU** at depth 10,000.
 - [ ] **Phase 4 — Training & Applications**: Backprop on NPU, pick real ML task.
 
 ## Hardware Requirements
