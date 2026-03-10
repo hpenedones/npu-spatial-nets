@@ -95,95 +95,74 @@ def _generate_npu(
 ) -> tuple[str, float, float]:
     """Generate text using NPU for the recurrent core.
 
+    For multi-layer models, makes num_layers NPU calls per character,
+    each with a different weight matrix.
+
     Returns (text, total_elapsed_s, npu_compute_s).
     """
     from spatial_mlp import to_tiled, from_tiled
 
     model.eval()
-    depth = model.depth
 
-    # Extract weights and convert to tiled bf16 layout
-    W_f32 = model.W.data.numpy()
-    W_bf16 = W_f32.astype(bfloat16)
-    W_tiled = to_tiled(W_bf16)
+    # Extract weights — one tiled bf16 matrix per layer
+    W_tiled_list = []
+    for W in model.weights:
+        W_bf16 = W.data.numpy().astype(bfloat16)
+        W_tiled_list.append(to_tiled(W_bf16))
 
-    # We generate TOTAL_SAMPLES sequences in parallel, using the same prompt
     prompt_ids = vocab.encode(prompt)
     hidden = np.zeros((TOTAL_SAMPLES, H), dtype=bfloat16)
     embed_w = model.embed.weight.data.numpy().astype(bfloat16)
     readout_w = model.readout.weight.data.numpy().astype(np.float32)
     readout_b = model.readout.bias.data.numpy().astype(np.float32)
+    output_zeros = np.zeros(TOTAL_SAMPLES * H, dtype=bfloat16)
 
     generated = list(prompt_ids)
     npu_total = 0.0
     t0 = time.perf_counter()
 
-    # Process prompt through the model
+    def _run_recurrence(hidden):
+        """Run all layers on NPU, return updated hidden and NPU time."""
+        npu_time = 0.0
+        for W_tiled in W_tiled_list:
+            input_tiled = np.concatenate([
+                to_tiled(hidden[i * B : (i + 1) * B])
+                for i in range(NUM_TILES)
+            ])
+            npu_op.write_buffer("input", input_tiled)
+            npu_op.write_buffer("weights", W_tiled)
+            npu_op.write_buffer("output", output_zeros.copy())
+
+            npu_time += npu_op.run_runlist()
+
+            out_flat = npu_op.read_buffer(
+                "output", (TOTAL_SAMPLES * H,), copy=True
+            )
+            hidden = np.concatenate([
+                from_tiled(out_flat[i * B * H : (i + 1) * B * H], B, H)
+                for i in range(NUM_TILES)
+            ])
+        return hidden, npu_time
+
+    # Process prompt
     for char_idx in prompt_ids:
-        emb = embed_w[char_idx]  # (H,)
-        hidden = hidden + emb[np.newaxis, :]  # broadcast add
-
-        # Send to NPU: convert to tiled layout
-        input_tiled = np.concatenate([
-            to_tiled(hidden[i * B : (i + 1) * B])
-            for i in range(NUM_TILES)
-        ])
-        npu_op.write_buffer("input", input_tiled)
-        npu_op.write_buffer("weights", W_tiled)
-        npu_op.write_buffer(
-            "output", np.zeros(TOTAL_SAMPLES * H, dtype=bfloat16)
-        )
-
-        npu_elapsed = npu_op.run_runlist()
-        npu_total += npu_elapsed
-
-        # Read back
-        out_flat = npu_op.read_buffer(
-            "output", (TOTAL_SAMPLES * H,), copy=True
-        )
-        hidden = np.concatenate([
-            from_tiled(out_flat[i * B * H : (i + 1) * B * H], B, H)
-            for i in range(NUM_TILES)
-        ])
+        hidden = hidden + embed_w[char_idx][np.newaxis, :]
+        hidden, dt = _run_recurrence(hidden)
+        npu_total += dt
 
     # Autoregressive generation
     for step in range(num_chars):
-        # Compute logits on CPU from the first sequence
         h_f32 = hidden[0].astype(np.float32)
-        logits = h_f32 @ readout_w.T + readout_b
-        logits = logits / temperature
+        logits = (h_f32 @ readout_w.T + readout_b) / temperature
 
-        # Sample
         probs = np.exp(logits - logits.max())
         probs = probs / probs.sum()
         next_idx = np.random.choice(len(probs), p=probs)
         generated.append(next_idx)
 
-        # Inject new character into all sequences
-        emb = embed_w[next_idx]
-        hidden = hidden + emb[np.newaxis, :]
-
-        # NPU recurrence
-        input_tiled = np.concatenate([
-            to_tiled(hidden[i * B : (i + 1) * B])
-            for i in range(NUM_TILES)
-        ])
-        npu_op.write_buffer("input", input_tiled)
-        npu_op.write_buffer("weights", W_tiled)
-        npu_op.write_buffer(
-            "output", np.zeros(TOTAL_SAMPLES * H, dtype=bfloat16)
-        )
-
-        npu_elapsed = npu_op.run_runlist()
-        npu_total += npu_elapsed
-
-        out_flat = npu_op.read_buffer(
-            "output", (TOTAL_SAMPLES * H,), copy=True
-        )
-        hidden = np.concatenate([
-            from_tiled(out_flat[i * B * H : (i + 1) * B * H], B, H)
-            for i in range(NUM_TILES)
-        ])
+        hidden = hidden + embed_w[next_idx][np.newaxis, :]
+        hidden, dt = _run_recurrence(hidden)
+        npu_total += dt
 
     total_elapsed = time.perf_counter() - t0
     return vocab.decode(generated), total_elapsed, npu_total
@@ -226,7 +205,8 @@ def main():
     print(f"TileFlow Character LM — Generate ({args.device.upper()})")
     print("=" * 60)
     print(f"Parameters: {params['total']:,} "
-          f"(W: {params['recurrent_W']:,}, depth: {model.depth})")
+          f"(W: {params['recurrent_W']:,} in {params['num_layers']} layer(s), "
+          f"depth: {model.depth})")
     print(f"Prompt: {repr(args.prompt)}")
     print(f"Generating {args.num_chars} characters...")
     print()
@@ -243,7 +223,7 @@ def main():
               f"{chars_per_sec:.0f} chars/s, "
               f"depth={model.depth}")
     else:
-        num_iters = model.depth // 2
+        num_iters = model.depth_per_layer // 2
         npu_op = _setup_npu(num_iters)
         text, total_elapsed, npu_time = _generate_npu(
             model, vocab, args.prompt, args.num_chars, args.temperature, npu_op

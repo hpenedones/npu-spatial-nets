@@ -23,6 +23,15 @@ from char_lm.model import RecurrentCharLM
 CHECKPOINT_DIR = Path(__file__).parent.parent / "data"
 
 
+def _clamp_spectral_norm(model: RecurrentCharLM, max_norm: float = 1.0):
+    """Project each W to have spectral norm ≤ max_norm."""
+    with torch.no_grad():
+        for W in model.weights:
+            sigma = torch.linalg.norm(W, ord=2)
+            if sigma > max_norm:
+                W.mul_(max_norm / sigma)
+
+
 def train_epoch(
     model: RecurrentCharLM,
     loader: DataLoader,
@@ -45,6 +54,7 @@ def train_epoch(
         loss.backward()
         nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         optimizer.step()
+        _clamp_spectral_norm(model)
 
         total_loss += loss.item()
         num_batches += 1
@@ -82,6 +92,7 @@ def save_checkpoint(
             "hidden_size": model.hidden_size,
             "depth": model.depth,
             "bptt_depth": model.bptt_depth,
+            "num_layers": model.num_layers,
             "vocab_size": vocab.size,
             **metadata,
         },
@@ -98,6 +109,7 @@ def load_checkpoint(path: Path) -> tuple[RecurrentCharLM, Vocabulary]:
         hidden_size=ckpt["hidden_size"],
         depth=ckpt["depth"],
         bptt_depth=ckpt["bptt_depth"],
+        num_layers=ckpt.get("num_layers", 1),
     )
     model.load_state_dict(ckpt["model_state"])
     return model, vocab
@@ -111,6 +123,8 @@ def main():
                         help="Backprop-through-time depth (default: 20)")
     parser.add_argument("--hidden-size", type=int, default=128,
                         help="Hidden dimension (default: 128)")
+    parser.add_argument("--num-layers", type=int, default=1,
+                        help="Number of distinct W matrices (default: 1)")
     parser.add_argument("--seq-len", type=int, default=64,
                         help="Training sequence length (default: 64)")
     parser.add_argument("--batch-size", type=int, default=32,
@@ -158,14 +172,15 @@ def main():
         hidden_size=args.hidden_size,
         depth=args.depth,
         bptt_depth=args.bptt_depth,
+        num_layers=args.num_layers,
     )
     params = model.count_parameters()
     print(f"Model parameters:")
     print(f"  Embedding:    {params['embedding']:,}")
-    print(f"  Recurrent W:  {params['recurrent_W']:,}")
+    print(f"  Recurrent W:  {params['recurrent_W']:,} ({params['num_layers']} layer(s) × {args.hidden_size}²)")
     print(f"  Readout:      {params['readout']:,}")
     print(f"  Total:        {params['total']:,}")
-    print(f"  Depth:        {args.depth} ({args.bptt_depth} with gradients)")
+    print(f"  Depth:        {args.depth} ({model.depth_per_layer}/layer, {args.bptt_depth} with gradients)")
     print()
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)

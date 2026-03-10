@@ -194,6 +194,60 @@ The NPU **strongly wins** vs CPU for deep recurrent computations because:
 - CPU: every 128×128 matmul bounces through L1/L2/L3 cache hierarchy
 - NPU: weights + activations stay in 64 KB SRAM, no cache misses, no memory bus
 
+## Phase 4: Character-Level Language Model
+
+A character-level language model trained on tiny Shakespeare, demonstrating
+the full pipeline: **GPU training → checkpoint → NPU inference**.
+
+### Architecture
+
+```
+ CPU                     NPU (24 tiles × 48 batch = 1152 sequences)
+┌──────────────┐        ┌─────────────────────────────────────────────┐
+│ Embedding    │        │  h = ReLU(h @ W)  ×  depth iterations      │
+│ char → 128d  │───────▶│  Weight W (128×128) held in each tile's    │
+│              │        │  64 KB SRAM — no DDR traffic                │
+│ h = h + emb  │◀───────│                                             │
+│              │        └─────────────────────────────────────────────┘
+│ Readout      │
+│ 128d → logits│
+│ → sample char│
+└──────────────┘
+```
+
+- **33K parameters**: Embedding (8K) + W (16K) + Readout (8K)
+- **Weight-tied recurrence**: Same W applied `depth` times per character
+- **Train fast, infer deep**: Train at depth=50 on GPU (~22s/epoch),
+  infer at depth=500+ on NPU where compute dominates overhead
+
+### Usage
+
+```bash
+# Train (3 epochs, ~1 min on AMD Radeon 890M)
+HSA_OVERRIDE_GFX_VERSION=11.0.0 python -m char_lm.train \
+    --depth 50 --epochs 3 --device cuda
+
+# Generate on CPU
+python -m char_lm.generate --device cpu --depth 500
+
+# Generate on NPU (1152 parallel sequences)
+python -m char_lm.generate --device npu --depth 2000
+```
+
+### Results
+
+| Device | Depth | Chars/s (1 seq) | Throughput (all seqs) |
+|--------|-------|----------------:|----------------------:|
+| CPU    | 50    | 6,208           | 6,208                 |
+| CPU    | 500   | 752             | 752                   |
+| CPU    | 2000  | 172             | 172                   |
+| NPU    | 50    | 659             | 759,168               |
+| NPU    | 500   | 659             | 759,168               |
+| NPU    | 2000  | 222             | 255,744               |
+
+At depth=2000, the NPU processes **1,152 sequences simultaneously** at ~20
+TFLOPS, achieving **~1,500× total throughput** vs single-threaded CPU.
+
 ## Project Structure
 
 ```
@@ -239,7 +293,12 @@ into small, well-named functions — one for each aspect of the hardware mapping
 - [x] **Phase 3 — Recurrent MLP (On-Chip Loop)**: Single weight, hardware loop.
   24 tiles (3 rows × 8 columns) via MemTile split/forward/join.
   **8.95 TFLOPS, 20× speedup over CPU** at depth 10,000.
-- [ ] **Phase 4 — Training & Applications**: Backprop on NPU, pick real ML task.
+- [x] **Phase 3b — Fused Kernel Optimization**: Fused matmul+ReLU kernel, B=48.
+  **23.93 TFLOPS (95.7% peak), 26× CPU speedup.**
+- [x] **Phase 4 — Character Language Model**: Train recurrent char-LM on
+  tiny Shakespeare (GPU via ROCm), generate text on NPU.
+  256K chars/s throughput (1152 parallel sequences).
+- [ ] **Phase 5 — Scaling Up**: Larger models, more weights, real applications.
 
 ## Hardware Requirements
 
