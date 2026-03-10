@@ -38,6 +38,7 @@ def train_epoch(
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     grad_clip: float = 1.0,
+    log_interval: int = 50,
 ) -> float:
     """Train for one epoch, return average loss."""
     model.train()
@@ -58,6 +59,10 @@ def train_epoch(
 
         total_loss += loss.item()
         num_batches += 1
+
+        if num_batches % log_interval == 0:
+            avg = total_loss / num_batches
+            print(f"    batch {num_batches:4d} | loss {avg:.4f}", flush=True)
 
     return total_loss / num_batches
 
