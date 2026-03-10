@@ -13,32 +13,16 @@ than CPU execution of the same network. The network can be any architecture
 with learnable parameters and non-linearities — we design the network to
 match the hardware, not the other way around.
 
+> 📄 **White paper**: A detailed PDF document explaining the architecture,
+> design decisions, and results is available at
+> [`docs/tileflow_whitepaper.pdf`](docs/tileflow_whitepaper.pdf).
+> Regenerate it with `python docs/generate_whitepaper.py`.
+
 ## The Hardware
 
 The XDNA 2 NPU in the Ryzen AI 9 HX 370 is a **spatial dataflow computer**:
 
-```
-         Col 0    Col 1    Col 2    Col 3    Col 4    Col 5    Col 6    Col 7
-        ┌────────┬────────┬────────┬────────┬────────┬────────┬────────┬────────┐
-Row 5   │Compute │Compute │Compute │Compute │Compute │Compute │Compute │Compute │
-        │ Tile   │ Tile   │ Tile   │ Tile   │ Tile   │ Tile   │ Tile   │ Tile   │
-        ├────────┼────────┼────────┼────────┼────────┼────────┼────────┼────────┤
-Row 4   │Compute │Compute │Compute │Compute │Compute │Compute │Compute │Compute │
-        │ Tile   │ Tile   │ Tile   │ Tile   │ Tile   │ Tile   │ Tile   │ Tile   │
-        ├────────┼────────┼────────┼────────┼────────┼────────┼────────┼────────┤
-Row 3   │Compute │Compute │Compute │Compute │Compute │Compute │Compute │Compute │
-        │ Tile   │ Tile   │ Tile   │ Tile   │ Tile   │ Tile   │ Tile   │ Tile   │
-        ├────────┼────────┼────────┼────────┼────────┼────────┼────────┼────────┤
-Row 2   │Compute │Compute │Compute │Compute │Compute │Compute │Compute │Compute │
-        │ Tile   │ Tile   │ Tile   │ Tile   │ Tile   │ Tile   │ Tile   │ Tile   │
-        ├────────┼────────┼────────┼────────┼────────┼────────┼────────┼────────┤
-Row 1   │MemTile │MemTile │MemTile │MemTile │MemTile │MemTile │MemTile │MemTile │
-        │ 512 KB │ 512 KB │ 512 KB │ 512 KB │ 512 KB │ 512 KB │ 512 KB │ 512 KB │
-        ├────────┼────────┼────────┼────────┼────────┼────────┼────────┼────────┤
-Row 0   │  Shim  │  Shim  │  Shim  │  Shim  │  Shim  │  Shim  │  Shim  │  Shim  │
-        │  (DMA) │  (DMA) │  (DMA) │  (DMA) │  (DMA) │  (DMA) │  (DMA) │  (DMA) │
-        └────────┴────────┴────────┴────────┴────────┴────────┴────────┴────────┘
-```
+![XDNA 2 NPU Tile Array](docs/xdna2_hardware.png)
 
 | Property | Value |
 |---|---|
@@ -153,24 +137,7 @@ A recurrent MLP that applies the same weight matrix in a tight hardware loop,
 keeping all activations in tile SRAM throughout. This amortizes the ~120 µs
 per-invocation overhead across thousands of on-chip compute steps:
 
-```
-                   Column 0        Column 1        ...  Column 7
-DDR → Input  →   ┌───────────┐   ┌───────────┐        ┌───────────┐
-                  │ Row 2     │   │ Row 2     │        │ Row 2     │
-                  │  W in SRAM│   │  W in SRAM│   ...  │  W in SRAM│
-                  │ [A↔B loop]│   │ [A↔B loop]│        │ [A↔B loop]│
-                  ├───────────┤   ├───────────┤        ├───────────┤
-                  │ Row 3     │   │ Row 3     │        │ Row 3     │
-                  │  W in SRAM│   │  W in SRAM│   ...  │  W in SRAM│
-                  │ [A↔B loop]│   │ [A↔B loop]│        │ [A↔B loop]│
-                  ├───────────┤   ├───────────┤        ├───────────┤
-                  │ Row 4     │   │ Row 4     │        │ Row 4     │
-                  │  W in SRAM│   │  W in SRAM│   ...  │  W in SRAM│
-                  │ [A↔B loop]│   │ [A↔B loop]│        │ [A↔B loop]│
-                  └───────────┘   └───────────┘        └───────────┘
-DDR ← Output ←        ↑               ↑                     ↑
-                     MemTile split/forward/join (row 1)
-```
+![Recurrent MLP Architecture](docs/recurrent_mlp.png)
 
 **Key design decisions:**
 - **24 tiles** across 3 rows × 8 columns (max before MemTile routing saturates)
@@ -193,6 +160,10 @@ DDR ← Output ←        ↑               ↑                     ↑
 | 24 (3 rows) | 10,000 | 14.05 ms | **8.95** | 439 | **20.4×** |
 
 **Peak NPU throughput: 8.95 TFLOPS** (35.8% of 25 TFLOPS theoretical).
+
+### Performance Scaling
+
+![Performance Scaling](docs/performance.png)
 
 ### Scaling Analysis
 
@@ -219,6 +190,31 @@ paths per MemTile, which fits; at 4 rows = 12 paths, the router fails.
 The NPU **strongly wins** vs CPU for deep recurrent computations because:
 - CPU: every 128×128 matmul bounces through L1/L2/L3 cache hierarchy
 - NPU: weights + activations stay in 64 KB SRAM, no cache misses, no memory bus
+
+## Project Structure
+
+```
+npu-spatial-nets/
+├── spatial_mlp/
+│   ├── __init__.py        # Tiling utilities (to_tiled, from_tiled)
+│   ├── design.py          # IRON design: FIFO topology, workers, DMA sequences
+│   ├── op.py              # IRON operator: compilation artifacts, runtime buffers
+│   └── test.py            # Benchmark: NPU vs CPU execution and reporting
+├── aie_kernels/
+│   └── mlp_kernels.cc     # Custom AIE2P kernels: ReLU, copy (bf16, SIMD)
+├── docs/
+│   ├── generate_figures.py      # Regenerate architecture diagrams
+│   ├── generate_whitepaper.py   # Regenerate white paper PDF
+│   ├── xdna2_hardware.png       # Figure 1: NPU tile array
+│   ├── recurrent_mlp.png        # Figure 2: MLP mapped to tiles
+│   ├── performance.png          # Figure 3: Throughput scaling
+│   └── tileflow_whitepaper.pdf  # Full white paper document
+└── README.md
+```
+
+Each module has a single responsibility. The `design.py` module is decomposed
+into small, well-named functions — one for each aspect of the hardware mapping
+(validation, kernels, FIFO topology, workers, tensor access patterns, DMA).
 
 ## Toolchain
 
