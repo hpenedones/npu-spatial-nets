@@ -32,14 +32,14 @@ tight hardware loop, never touching DDR until the final result is copied out.
 **Depth**: Each invocation computes ``2 × num_iters`` matmul+ReLU steps
 (two per loop body, ping-ponging between buffers A and B).
 
-**SRAM budget** (H=128, B=16)::
+**SRAM budget** (H=128, B=48)::
 
     Weight   (depth=1): 128×128×2 = 32 KB
-    Input    (depth=1):  16×128×2 =  4 KB
-    Output   (depth=1):  16×128×2 =  4 KB
+    Input    (depth=1):  48×128×2 = 12 KB
+    Output   (depth=1):  48×128×2 = 12 KB
     Stack:                          ~1 KB
     ──────────────────────────────────────
-    Total:                         ~41 KB  (fits 64 KB)
+    Total:                         ~57 KB  (fits 64 KB)
 """
 
 import sys
@@ -104,23 +104,20 @@ def _host_type(num_tiles, B, H):
 # ── Kernel definitions ───────────────────────────────────────────────────
 
 def _define_kernels(act_ty, weight_ty):
-    """Create the four tile-level kernel objects.
+    """Create the tile-level kernel objects.
 
     All kernels are linked from ``mlp_kernels.a`` which bundles:
-    - ``mm.cc``  (from IRON): C += A × B  (bf16 matmul, accumulates)
-    - ``mlp_kernels.cc`` (ours): zero, ReLU, copy
+    - ``matmul_relu.cc`` (ours): C = ReLU(A × B) — fused zero+matmul+ReLU
+    - ``mlp_kernels.cc`` (ours): copy_bf16
 
     Returns:
-        Tuple of (zero, matmul, relu, copy) Kernel objects.
+        Tuple of (matmul_relu, copy) Kernel objects.
     """
-    zero = Kernel("zero_bf16", "mlp_kernels.a", [act_ty])
-    matmul = Kernel("matmul_bf16_bf16", "mlp_kernels.a",
-                     [act_ty, weight_ty, act_ty])
-    relu = Kernel("relu_inplace_bf16", "mlp_kernels.a",
-                   [act_ty, np.int32])
+    matmul_relu = Kernel("matmul_relu_bf16_bf16", "mlp_kernels.a",
+                          [act_ty, weight_ty, act_ty])
     copy = Kernel("copy_bf16", "mlp_kernels.a",
                    [act_ty, act_ty, np.int32])
-    return zero, matmul, relu, copy
+    return matmul_relu, copy
 
 
 # ── FIFO topology ────────────────────────────────────────────────────────
@@ -206,27 +203,22 @@ def _make_worker_body(num_iters, activation_size):
 
     Each worker:
     1. Acquires its input (x), output (y), and weight (W) buffers.
-    2. Loops ``num_iters`` times, ping-ponging between x and y:
-       - y = ReLU(x @ W)
-       - x = ReLU(y @ W)
+    2. Loops ``num_iters`` times, ping-ponging between x and y using a fused
+       matmul+ReLU kernel: ``C = ReLU(A × B)`` — zero-init, matmul, and
+       ReLU are all done in one kernel call (2 calls per iteration).
     3. Copies the final result to the output buffer and releases all FIFOs.
 
     CRITICAL: All FIFO acquire/release must happen *outside* the loop.
     Putting them inside ``range_()`` causes a deadlock in the DMA engine.
     """
-    def worker_body(of_in, of_out, of_w, zero_fn, mm_fn, relu_fn, copy_fn):
+    def worker_body(of_in, of_out, of_w, mm_relu_fn, copy_fn):
         x = of_in.acquire(1)
         y = of_out.acquire(1)
         w = of_w.acquire(1)
 
         for _ in range_(num_iters):
-            zero_fn(y)
-            mm_fn(x, w, y)       # y = x @ W  (mm.cc accumulates: y += x @ W)
-            relu_fn(y, activation_size)
-
-            zero_fn(x)
-            mm_fn(y, w, x)       # x = y @ W
-            relu_fn(x, activation_size)
+            mm_relu_fn(x, w, y)  # y = ReLU(x @ W)
+            mm_relu_fn(y, w, x)  # x = ReLU(y @ W)
 
         copy_fn(x, y, activation_size)  # copy final result to output buffer
 
@@ -357,7 +349,7 @@ def recurrent_mlp(
     weight_ty = _weight_type(H)
 
     # Kernels
-    zero, matmul, relu, copy = _define_kernels(act_ty, weight_ty)
+    matmul_relu, copy = _define_kernels(act_ty, weight_ty)
 
     # Build per-column FIFO topology
     all_tile_w, all_tile_in, all_tile_out = {}, {}, {}
@@ -389,7 +381,7 @@ def recurrent_mlp(
                     all_tile_in[(col, row)].cons(),
                     all_tile_out[(col, row)].prod(),
                     all_tile_w[(col, row)].cons(),
-                    zero, matmul, relu, copy,
+                    matmul_relu, copy,
                 ],
                 placement=Tile(col=col, row=2 + row),
             ))

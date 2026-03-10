@@ -39,9 +39,6 @@ from iron.common import (
     PythonGeneratedMLIRArtifact,
 )
 
-# Path from IRON's aie_kernels directory to the accumulating matmul kernel.
-_MM_KERNEL_SUBPATH = Path("aie_kernels") / "aie2p" / "mm.cc"
-
 # Compiler flag to use BFP16 emulation for bfloat16 matmul on AIE2P.
 _BFP16_FLAG = "-DAIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16"
 
@@ -78,25 +75,15 @@ class AIERecurrentMLP(AIEOperatorBase):
     def set_up_artifacts(self):
         """Define the compilation dependency graph.
 
-        The graph is::
-
-            mm.cc ──► mlp_mm.o ──┐
-                                 ├──► mlp_kernels.a ──┐
-            mlp_kernels.cc ──► mlp_relu.o ──┘          │
-                                                       ├──► {name}.xclbin
-            design.py ──► {name}.mlir ────────────────┘
-                              │
-                              └──► {name}.bin  (instruction sequence)
-
         Both xclbin and bin use ``--dynamic-objFifos`` for runtime-flexible
         ObjectFIFO sizing.
         """
         project_dir = Path(__file__).parent.parent
-        iron_dir = Path(self.context.base_dir)
         name = self._artifact_name()
 
-        mm_source = SourceArtifact.new(str(iron_dir / _MM_KERNEL_SUBPATH))
-        relu_source = SourceArtifact.new(
+        matmul_relu_source = SourceArtifact.new(
+            str(project_dir / "aie_kernels" / "matmul_relu.cc"))
+        copy_source = SourceArtifact.new(
             str(project_dir / "aie_kernels" / "mlp_kernels.cc"))
 
         mlir_artifact = PythonGeneratedMLIRArtifact.new(
@@ -113,18 +100,18 @@ class AIERecurrentMLP(AIEOperatorBase):
             "mlp_kernels.a",
             depends=[
                 KernelObjectArtifact.new(
-                    "mlp_mm.o",
+                    "mlp_mm_relu.o",
                     extra_flags=[
                         f"-DDIM_M={self.B}", f"-DDIM_K={self.H}",
-                        f"-DDIM_N={self.H}", "-Dbf16_bf16_ONLY",
+                        f"-DDIM_N={self.H}",
                         _BFP16_FLAG,
                     ],
-                    depends=[mm_source],
+                    depends=[matmul_relu_source],
                 ),
                 KernelObjectArtifact.new(
-                    "mlp_relu.o",
+                    "mlp_copy.o",
                     extra_flags=[_BFP16_FLAG],
-                    depends=[relu_source],
+                    depends=[copy_source],
                 ),
             ],
         )

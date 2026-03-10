@@ -240,7 +240,7 @@ def print_results(npu_metrics, cpu_metrics, correctness, npu_times,
 
 # ── Main benchmark ────────────────────────────────────────────────────────
 
-def benchmark(H=128, B=16, num_tiles=24, num_iters=1000,
+def benchmark(H=128, B=48, num_tiles=24, num_iters=1000,
               warmup=3, timed_iters=10):
     """Run the full NPU vs CPU benchmark and print results.
 
@@ -316,8 +316,8 @@ if __name__ == "__main__":
         description="Benchmark recurrent MLP on NPU vs CPU.")
     parser.add_argument("--H", type=int, default=128,
                         help="Hidden dimension (default: 128)")
-    parser.add_argument("--B", type=int, default=16,
-                        help="Batch size per tile (default: 16)")
+    parser.add_argument("--B", type=int, default=48,
+                        help="Batch size per tile (default: 48)")
     parser.add_argument("--tiles", type=int, default=24,
                         help="Number of compute tiles, 1-24 (default: 24)")
     parser.add_argument("--iters", type=int, default=1000,
