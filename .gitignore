@@ -209,4 +209,8 @@ __marimo__/
 # Data files
 data/shakespeare.txt
 data/*.pt
+data/*.txt
+
+# MLflow
+mlruns/
 

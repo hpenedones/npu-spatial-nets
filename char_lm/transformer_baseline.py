@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 """
-Minimal Transformer baseline for character-level Shakespeare.
+Minimal Transformer baseline for character-level language modelling.
 
 This is a standard GPT-style model (causal attention + feedforward) used
 as a quality reference.  It trains on GPU in minutes and reaches val loss
-~1.5, which is the target our NPU-friendly architecture should approach.
+~1.5 on Shakespeare, which is the target our NPU-friendly architecture
+should approach.
 
 Usage::
 
-    python -m char_lm.transformer_baseline [--epochs 10] [--device auto]
+    python -m char_lm.transformer_baseline [--dataset wikipedia] [--epochs 10]
 """
 
 import argparse
@@ -21,9 +22,11 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from pathlib import Path
 
-from char_lm.data import load_shakespeare, Vocabulary
+from char_lm.data import load_shakespeare, load_wikipedia, Vocabulary
 
 CHECKPOINT_DIR = Path(__file__).parent.parent / "data"
+
+import mlflow
 
 
 class TransformerCharLM(nn.Module):
@@ -113,7 +116,7 @@ class TransformerCharLM(nn.Module):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Transformer baseline for char-level Shakespeare")
+        description="Transformer baseline for char-level LM")
     parser.add_argument("--d-model", type=int, default=128)
     parser.add_argument("--n-heads", type=int, default=4)
     parser.add_argument("--n-layers", type=int, default=4)
@@ -122,6 +125,10 @@ def main():
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--dataset", type=str, default="shakespeare",
+                        choices=["shakespeare", "wikipedia"])
+    parser.add_argument("--wiki-chars", type=int, default=10_000_000,
+                        help="Max raw chars for wikipedia dataset (default: 10M)")
     parser.add_argument("--device", type=str, default="auto")
     args = parser.parse_args()
 
@@ -131,13 +138,18 @@ def main():
         device = torch.device(args.device)
 
     print("=" * 60)
-    print("Transformer Baseline — Character LM on Shakespeare")
+    print(f"Transformer Baseline — Character LM on {args.dataset}")
     print("=" * 60)
     print(f"Device: {device}")
     if device.type == "cuda":
         print(f"  GPU: {torch.cuda.get_device_name(0)}")
 
-    train_ds, val_ds, vocab = load_shakespeare(seq_len=args.seq_len)
+    if args.dataset == "wikipedia":
+        train_ds, val_ds, vocab = load_wikipedia(
+            seq_len=args.seq_len, max_chars=args.wiki_chars)
+    else:
+        train_ds, val_ds, vocab = load_shakespeare(seq_len=args.seq_len)
+
     train_loader = DataLoader(
         train_ds, batch_size=args.batch_size, shuffle=True, drop_last=True)
     val_loader = DataLoader(
@@ -166,68 +178,126 @@ def main():
         optimizer, T_max=args.epochs)
 
     best_val_loss = float("inf")
-    ckpt_path = CHECKPOINT_DIR / "transformer_baseline.pt"
+    ckpt_path = CHECKPOINT_DIR / f"{args.dataset}_transformer_checkpoint.pt"
 
-    for epoch in range(1, args.epochs + 1):
-        t0 = time.time()
+    total_batches = len(train_loader)
+    save_every = max(200, total_batches // 5)
 
-        # Train
-        model.train()
-        total_loss = 0.0
-        num_batches = 0
-        for x, y in train_loader:
-            x, y = x.to(device), y.to(device)
-            optimizer.zero_grad()
-            logits = model(x)
-            loss = F.cross_entropy(
-                logits.reshape(-1, logits.size(-1)), y.reshape(-1))
-            loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
-            total_loss += loss.item()
-            num_batches += 1
-        train_loss = total_loss / num_batches
-        scheduler.step()
+    def _save(val_loss=None, train_loss=None):
+        torch.save({
+            "model_state": {k: v.cpu() for k, v in model.state_dict().items()},
+            "vocab_chars": vocab.chars,
+            "config": {
+                "d_model": args.d_model, "n_heads": args.n_heads,
+                "n_layers": args.n_layers, "d_ff": args.d_ff,
+                "max_seq_len": args.seq_len, "vocab_size": vocab.size,
+            },
+            "val_loss": val_loss,
+            "train_loss": train_loss,
+        }, ckpt_path)
 
-        # Eval
-        model.eval()
-        val_total = 0.0
-        val_batches = 0
-        with torch.no_grad():
-            for x, y in val_loader:
+    # MLflow tracking
+    mlflow.set_tracking_uri(f"file://{CHECKPOINT_DIR.parent / 'mlruns'}")
+    mlflow.set_experiment("char_lm")
+    run_name = (f"transformer_{args.dataset}"
+                f"_L{args.n_layers}_D{args.d_model}_FF{args.d_ff}")
+
+    with mlflow.start_run(run_name=run_name):
+        mlflow.log_params({
+            "model": "transformer",
+            "dataset": args.dataset,
+            "n_layers": args.n_layers,
+            "d_model": args.d_model,
+            "n_heads": args.n_heads,
+            "d_ff": args.d_ff,
+            "vocab_size": vocab.size,
+            "total_params": params,
+            "seq_len": args.seq_len,
+            "batch_size": args.batch_size,
+            "lr": args.lr,
+            "epochs": args.epochs,
+        })
+
+        global_step = 0
+        for epoch in range(1, args.epochs + 1):
+            t0 = time.time()
+
+            # Train
+            model.train()
+            total_loss = 0.0
+            num_batches = 0
+            for x, y in train_loader:
                 x, y = x.to(device), y.to(device)
+                optimizer.zero_grad()
                 logits = model(x)
                 loss = F.cross_entropy(
                     logits.reshape(-1, logits.size(-1)), y.reshape(-1))
-                val_total += loss.item()
-                val_batches += 1
-        val_loss = val_total / val_batches
+                loss.backward()
+                nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+                total_loss += loss.item()
+                num_batches += 1
+                global_step += 1
 
-        elapsed = time.time() - t0
-        marker = ""
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            torch.save({
-                "model_state": {k: v.cpu() for k, v in model.state_dict().items()},
-                "vocab_chars": vocab.chars,
-                "config": {
-                    "d_model": args.d_model, "n_heads": args.n_heads,
-                    "n_layers": args.n_layers, "d_ff": args.d_ff,
-                    "max_seq_len": args.seq_len, "vocab_size": vocab.size,
-                },
-                "val_loss": val_loss,
-            }, ckpt_path)
-            marker = " ← saved"
+                if num_batches % 50 == 0:
+                    avg = total_loss / num_batches
+                    mlflow.log_metric("batch/train_loss", avg, step=global_step)
+                    print(f"    batch {num_batches:4d} | loss {avg:.4f}",
+                          flush=True)
 
-        print(f"Epoch {epoch:3d}/{args.epochs} | "
-              f"train {train_loss:.4f} | val {val_loss:.4f} | "
-              f"ppl {math.exp(val_loss):.1f} | {elapsed:.1f}s{marker}")
+                if num_batches % save_every == 0:
+                    _save(train_loss=total_loss / num_batches)
+                    print(f"    batch {num_batches:4d} | mid-epoch checkpoint"
+                          f" saved", flush=True)
+
+            train_loss = total_loss / num_batches
+            scheduler.step()
+
+            # Eval
+            model.eval()
+            val_total = 0.0
+            val_batches = 0
+            with torch.no_grad():
+                for x, y in val_loader:
+                    x, y = x.to(device), y.to(device)
+                    logits = model(x)
+                    loss = F.cross_entropy(
+                        logits.reshape(-1, logits.size(-1)), y.reshape(-1))
+                    val_total += loss.item()
+                    val_batches += 1
+            val_loss = val_total / val_batches
+
+            elapsed = time.time() - t0
+
+            mlflow.log_metrics({
+                "epoch/train_loss": train_loss,
+                "epoch/val_loss": val_loss,
+                "epoch/val_ppl": math.exp(val_loss),
+                "epoch/time_s": elapsed,
+            }, step=epoch)
+
+            marker = ""
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                _save(val_loss=val_loss, train_loss=train_loss)
+                marker = " ← saved"
+
+            print(f"Epoch {epoch:3d}/{args.epochs} | "
+                  f"train {train_loss:.4f} | val {val_loss:.4f} | "
+                  f"ppl {math.exp(val_loss):.1f} | {elapsed:.1f}s{marker}")
+
+        mlflow.log_metric("best_val_loss", best_val_loss)
+        mlflow.log_metric("best_val_ppl", math.exp(best_val_loss))
+        mlflow.log_artifact(str(ckpt_path))
 
     # Generate sample
     print("\n" + "=" * 60)
     print("Sample generation (temperature=0.8):")
     print("=" * 60)
-    prompt = "\nTo be, or not to be"
+    if args.dataset == "wikipedia":
+        prompt = "\n= Albert Einstein =\n"
+    else:
+        prompt = "\nTo be, or not to be"
     prompt_ids = torch.tensor([vocab.encode(prompt)], device=device)
     generated = model.generate(prompt_ids, num_chars=300, temperature=0.8)
     print(vocab.decode(generated))

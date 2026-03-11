@@ -4,10 +4,12 @@
 Dataset and vocabulary for character-level language modelling.
 
 **Shift encoding:** Uppercase letters are represented as two characters —
-a shift marker ``^`` followed by the lowercase letter.  This halves the
-alphabet cost in the vocabulary (26 entries instead of 52) while still
-letting the model learn capitalisation patterns.  All digits 0-9 are
-included even if absent from the training corpus.
+a shift marker (``\\x01``, non-printable SOH) followed by the lowercase
+letter.  This halves the alphabet cost in the vocabulary (26 entries
+instead of 52) while still letting the model learn capitalisation
+patterns.  The shift marker cannot collide with any text content since
+non-printable characters are stripped during cleaning.  All digits 0-9
+are included even if absent from the training corpus.
 
 The vocabulary maps each unique character to an integer index.
 SequenceDataset produces fixed-length windows of (input, target) pairs
@@ -15,13 +17,14 @@ where target[t] = input[t+1] (next-character prediction).
 """
 
 import json
+import re
 import torch
 from torch.utils.data import Dataset
 from pathlib import Path
 
 DATA_DIR = Path(__file__).parent.parent / "data"
 
-SHIFT_CHAR = "^"  # precedes a lowercase letter to mean "uppercase"
+SHIFT_CHAR = "\x01"  # non-printable SOH; precedes a lowercase letter to mean "uppercase"
 
 
 def shift_encode(text: str) -> str:
@@ -140,4 +143,71 @@ def load_shakespeare(seq_len: int = 64, val_fraction: float = 0.1):
     train_ds = SequenceDataset(encoded[:split], vocab, seq_len)
     val_ds = SequenceDataset(encoded[split:], vocab, seq_len)
 
+    return train_ds, val_ds, vocab
+
+
+def _clean_wikitext(text: str) -> str:
+    """Clean wikitext tokenization artifacts and non-vocab characters."""
+    # Detokenize wikitext artifacts
+    text = text.replace(" @-@ ", "-")
+    text = text.replace(" @,@ ", ", ")
+    text = text.replace(" @.@ ", ".")
+    # Strip non-printable-ASCII (keep newline, space, printable 0x20-0x7e)
+    text = re.sub(r'[^\x0a\x20-\x7e]', '', text)
+    return text
+
+
+def load_wikipedia(
+    seq_len: int = 64,
+    val_fraction: float = 0.1,
+    max_chars: int = 10_000_000,
+):
+    """Load a subset of wikitext-103 and return train/val datasets + vocabulary.
+
+    Articles are formatted as ``= Title =\\n`` followed by body text.
+    The *max_chars* parameter controls how much raw text to use (before
+    shift encoding).  Default 10M chars ≈ 10× Shakespeare.
+    """
+    from datasets import load_dataset
+
+    cache_path = DATA_DIR / f"wikipedia_{max_chars // 1_000_000}M.txt"
+
+    if cache_path.exists():
+        print(f"Loading cached Wikipedia text from {cache_path}")
+        raw_text = cache_path.read_text()
+    else:
+        print("Downloading wikitext-103 (first time only)...")
+        ds = load_dataset(
+            "wikitext", "wikitext-103-raw-v1", split="train", trust_remote_code=True
+        )
+
+        # Concatenate lines into complete articles, take up to max_chars
+        parts: list[str] = []
+        total = 0
+        for row in ds:
+            line = row["text"]
+            if not line.strip():
+                continue
+            cleaned = _clean_wikitext(line)
+            if not cleaned.strip():
+                continue
+            parts.append(cleaned)
+            total += len(cleaned) + 1  # +1 for newline
+            if total >= max_chars:
+                break
+
+        raw_text = "\n".join(parts)
+        # Cache for next run
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(raw_text)
+        print(f"Cached {len(raw_text):,} chars to {cache_path}")
+
+    vocab = Vocabulary.from_text(raw_text)
+    encoded = shift_encode(raw_text)
+
+    split = int(len(encoded) * (1 - val_fraction))
+    train_ds = SequenceDataset(encoded[:split], vocab, seq_len)
+    val_ds = SequenceDataset(encoded[split:], vocab, seq_len)
+
+    print(f"Wikipedia: {len(raw_text):,} raw chars → {len(encoded):,} encoded chars")
     return train_ds, val_ds, vocab
