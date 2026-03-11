@@ -300,6 +300,10 @@ by domain so you can revisit this section as a reference while reading.
   <tr id="g-relu"><td>ReLU</td><td>Rectified Linear Unit</td>
       <td>The activation function max(x, 0). Simple, cheap to compute, and
           widely used.</td></tr>
+  <tr id="g-rmsnorm"><td>RMSNorm</td><td>Root Mean Square Normalisation</td>
+      <td>A layer-normalisation variant that divides each vector by its RMS
+          value: x / sqrt(mean(x&sup2;) + &epsilon;). Cheaper than LayerNorm
+          because it skips mean subtraction.</td></tr>
 
   <tr><td colspan="3" style="background:#e8e8e8;font-weight:600;">
     Toolchain &amp; software</td></tr>
@@ -322,7 +326,7 @@ by domain so you can revisit this section as a reference while reading.
   <tr id="g-bd"><td>BD</td><td>Buffer Descriptor</td>
       <td>A hardware structure in the DMA engine that describes one data
           transfer: source address, size, stride pattern. The 10-bit size
-          field (max 1024) is a constraint discussed in Section 4.3.</td></tr>
+          field (max 1024) is a constraint discussed in Section 3.6.</td></tr>
 </table>
 
 <h3>2.2 Key vocabulary (non-acronyms)</h3>
@@ -376,6 +380,11 @@ to readers who have worked above the hardware abstraction layer:
           execute arithmetic ~100&times; faster than DRAM can supply data. This
           is <em>the</em> fundamental reason NPUs (with data-local SRAM) can be
           dramatically faster than CPUs for the right workloads.</td></tr>
+  <tr id="v-memtile"><td class="vocab-term">MemTile</td>
+      <td>A memory-only tile (no compute core) in the NPU array, sitting between
+          the shim row and the compute rows. Contains 512&nbsp;KB of SRAM and
+          powerful DMA engines that can split, forward, or join data streams,
+          routing data from the shim to multiple compute rows.</td></tr>
   <tr id="v-interconnect"><td class="vocab-term">Interconnect</td>
       <td>The on-chip wiring and switches that connect tiles to each other and
           to memory tiles. Unlike a CPU&rsquo;s shared bus, the NPU interconnect
@@ -527,13 +536,14 @@ With this background, the rest of the paper should be accessible:
 </p>
 
 <ul>
-  <li><strong>Section 3</strong> describes the physical hardware: the tile
-      grid, memory sizes, and interconnect.</li>
-  <li><strong>Section 4</strong> presents the neural network architecture:
+  <li><strong>Section 3</strong> is the NPU primer: physical hardware,
+      tile microarchitecture, the C++ kernel API, the IRON Python
+      programming model, design patterns, and hardware constraints.</li>
+  <li><strong>Section 5</strong> presents the neural network architecture:
       block-recurrent character language model mapped to the NPU pipeline.</li>
-  <li><strong>Section 5</strong> shows quality and throughput results.</li>
-  <li><strong>Section 6</strong> describes the software toolchain.</li>
-  <li><strong>Section 7</strong> maps the code structure to the concepts.</li>
+  <li><strong>Section 6</strong> shows quality and throughput results.</li>
+  <li><strong>Section 7</strong> describes the software toolchain.</li>
+  <li><strong>Section 8</strong> maps the code structure to the concepts.</li>
 </ul>
 
 <h3 id="s-nn-fundamentals">2.7 Neural network fundamentals (for hardware engineers)</h3>
@@ -701,7 +711,582 @@ wins when data <strong>stays on-chip</strong>. Our architecture keeps weights
 in tile SRAM and passes activations tile-to-tile through FIFOs.
 </div>
 
-<h2>4. The Architecture: Block-Recurrent Character LM</h2>
+<h3>3.2 Inside an AIE tile</h3>
+
+<p>
+Each of the 32 compute tiles is a self-contained processor with four main
+subsystems.  Understanding what lives inside a tile is essential for knowing
+what computation is practical at the single-tile level.
+</p>
+
+<h4>VLIW+SIMD core</h4>
+<p>
+The heart of each tile is a <a href="#g-vliw" class="gref">VLIW</a> processor
+that can issue multiple operations per clock cycle: a vector multiply, a vector
+add, a scalar operation, and a memory load/store &mdash; all in the same cycle.
+The vector unit operates on <strong>256-bit vectors</strong>: 16&nbsp;elements
+of <a href="#g-bf16" class="gref">bfloat16</a>, 32&nbsp;elements of
+<a href="#g-int8" class="gref">int8</a>, or 8&nbsp;elements of float32.
+This <a href="#g-simd" class="gref">SIMD</a> width determines the natural
+&ldquo;chunk size&rdquo; for all tile-level programming: data buffers must
+be aligned to 64&nbsp;bytes and sized in multiples of 32&nbsp;bfloat16
+elements (64&nbsp;bytes) for efficient access.
+</p>
+
+<h4>Matrix multiply (MMUL) unit</h4>
+<p>
+Dedicated hardware multiplies small matrix tiles in a single instruction.
+The <a href="#g-mmul" class="gref">MMUL</a> unit operates on blocks of size
+<code>r&times;s&times;t</code>, meaning it multiplies an
+<code>r&times;s</code> sub-matrix of A by an <code>s&times;t</code>
+sub-matrix of B and accumulates into an <code>r&times;t</code> result.
+For <a href="#g-bf16" class="gref">bfloat16</a> on XDNA&nbsp;2:
+</p>
+
+<ul>
+  <li><strong>Native bf16:</strong> (r,&thinsp;s,&thinsp;t) = (4,&thinsp;8,&thinsp;8)
+      &mdash; 256 multiply-accumulate operations per instruction.</li>
+  <li><strong><a href="#g-bfp16" class="gref">BFP16</a> emulation:</strong>
+      (r,&thinsp;s,&thinsp;t) = (8,&thinsp;8,&thinsp;8) &mdash;
+      512 MACs per instruction, double the throughput. This groups bf16 values
+      into blocks sharing an exponent, trading negligible precision for 2&times;
+      throughput. We use this mode throughout.</li>
+</ul>
+
+<p>
+At ~1.5&nbsp;GHz, a single tile can sustain
+512&nbsp;MACs &times; 2&nbsp;FLOPs/MAC &times; 1.5&nbsp;GHz &asymp;
+<strong>~768 <a href="#g-gflops" class="gref">GFLOPS</a></strong> peak in
+<a href="#g-bfp16" class="gref">BFP16</a> mode.  Multiplied by 32&nbsp;tiles,
+this gives the advertised 25&nbsp;<a href="#g-tflops" class="gref">TFLOPS</a>
+system peak.
+</p>
+
+<h4>Local SRAM</h4>
+<p>
+Each tile has <strong>~64 KB</strong> of data
+<a href="#g-sram" class="gref">SRAM</a> &mdash; <em>all</em> the memory
+the core can access directly.  There are no caches; every byte is explicitly
+managed by the programmer.  A separate, smaller instruction memory holds the
+compiled kernel.  The 64&nbsp;KB budget must fit: (1) weight data,
+(2) input and output activation buffers, and (3) stack and local variables.
+This is the single most important constraint in NPU architecture co-design.
+</p>
+
+<h4>Per-tile DMA engine</h4>
+<p>
+Each tile has its own <a href="#g-dma" class="gref">DMA</a> engine that moves
+data between tile SRAM and neighbouring tiles or the
+<a href="#v-memtile" class="gref">MemTile</a>.  The programmer does not call
+DMA functions directly; instead, <a href="#g-iron" class="gref">IRON</a>&rsquo;s
+<a href="#g-fifo" class="gref">ObjectFIFOs</a> abstract these transfers as typed
+channels.  The compiler generates <a href="#g-bd" class="gref">buffer descriptors</a>
+that program the DMA with source addresses, sizes, and stride patterns.
+</p>
+
+<div class="key-insight">
+<strong>Mental model:</strong> Think of each tile as a tiny computer with
+64&nbsp;KB of RAM, a fast matrix-multiply co-processor, and a mail slot
+(DMA/FIFO) for sending and receiving data from neighbours.  There is no
+shared memory and no operating system &mdash; just your compiled C++ function
+running in an infinite loop, acquiring data, computing, and releasing results.
+</div>
+
+<h3>3.3 Writing AIE kernels (the C++ API)</h3>
+
+<p>
+Each tile runs a C++ function compiled by the AIE-specific
+<a href="#g-llvm" class="gref">Peano/LLVM-AIE</a> compiler.  The
+<code>aie_api/aie.hpp</code> header provides intrinsics that map directly
+to hardware instructions.  This section walks through the key patterns using
+our actual <code>norm_matmul_relu.cc</code> kernel as an example.
+</p>
+
+<h4>Vector types</h4>
+<p>
+The fundamental data type is a fixed-width SIMD vector:
+</p>
+<pre>
+aie::vector&lt;bfloat16, 16&gt;   // 16 × bf16 = 256 bits (one vector register)
+aie::vector&lt;int8, 32&gt;       // 32 × int8  = 256 bits
+aie::vector&lt;float, 8&gt;       //  8 × f32   = 256 bits
+</pre>
+<p>
+Load and store 16 bfloat16 elements at once with
+<code>aie::load_v&lt;16&gt;(ptr)</code> and
+<code>aie::store_v(ptr,&thinsp;vec)</code>.  Element-wise operations like
+<code>aie::max(vec,&thinsp;zeros)</code> (ReLU) operate on full vectors.
+</p>
+
+<h4>Matrix multiply: <code>aie::mmul</code></h4>
+<p>
+The core workhorse is the <code>aie::mmul&lt;r,&thinsp;s,&thinsp;t&gt;</code>
+class, which wraps the MMUL hardware unit:
+</p>
+<pre>
+using MMUL = aie::mmul&lt;8, 8, 8, bfloat16, bfloat16, accauto&gt;;
+
+MMUL acc(zeros);                      // zero-initialise accumulator in registers
+auto A = aie::load_v&lt;MMUL::size_A&gt;(pA);   // load 8×8 A tile (64 bf16)
+auto B = aie::load_v&lt;MMUL::size_B&gt;(pB);   // load 8×8 B tile (64 bf16)
+acc.mac(A, B);                        // acc += A × B  (hardware MAC instruction)
+auto result = acc.to_vector&lt;bfloat16&gt;();    // extract 8×8 result as bf16
+aie::store_v(pC, aie::max(result, zeros));  // store with fused ReLU
+</pre>
+<p>
+The <code>accauto</code> type uses higher-precision accumulators internally
+(typically 48-bit or fp32), converting back to bfloat16 only at
+<code>to_vector</code>.  This preserves numerical quality during large
+reductions.
+</p>
+
+<h4>2&times;2 tile expansion</h4>
+<p>
+Processing one 8&times;8 block at a time under-utilises registers.  Our
+kernels process <strong>four</strong> output blocks per inner-loop iteration
+(a 2&times;2 grid of MMUL accumulators).  This keeps 4 accumulator registers
+active simultaneously, allowing the VLIW scheduler to interleave loads and
+multiplies:
+</p>
+<pre>
+// Four accumulators for a 2×2 grid of output blocks
+MMUL C00(zeros), C01(zeros), C10(zeros), C11(zeros);
+
+for (i = 0; i &lt; K/8; ++i) {
+    A0 = load(pA1);  A1 = load(pA2);     // two rows of A
+    B0 = load(pB1);  B1 = load(pB2);     // two columns of B
+    C00.mac(A0, B0);  C01.mac(A0, B1);   // top row of output
+    C10.mac(A1, B0);  C11.mac(A1, B1);   // bottom row of output
+}
+// Store with fused ReLU: max(result, 0)
+store(pC, max(C00.to_vector(), zeros));
+// ... C01, C10, C11 similarly
+</pre>
+<p>
+This pattern yields roughly 2&times; throughput over naive single-block
+processing, because the compiler can pipeline loads with multiplies
+across the four independent accumulations.
+</p>
+
+<h4>Compiler hints</h4>
+<p>
+Two pragmas are critical for performance:
+</p>
+<ul>
+  <li><code>chess_prepare_for_pipelining</code> &mdash; tells the
+      &ldquo;chess&rdquo; scheduler (the AIE backend compiler) to overlap
+      iterations of the loop body, like a CPU&rsquo;s instruction pipeline
+      but at the loop level.  Without this, each iteration starts only after
+      the previous one fully completes.</li>
+  <li><code>chess_flatten_loop</code> &mdash; fully unrolls the inner loop
+      so the compiler can schedule all operations as one large block.  Used
+      on tight inner loops where the iteration count is small and known at
+      compile time.</li>
+</ul>
+
+<h4>The fused norm+matmul+ReLU kernel</h4>
+<p>
+Our <code>norm_matmul_relu.cc</code> kernel performs three operations in a
+single tile invocation:
+</p>
+<ol>
+  <li><strong>RMSNorm in-place</strong> (scalar float32): For each of the
+      B rows, accumulate the sum of squares, compute the inverse RMS using
+      8 Babylonian iterations (avoiding library dependencies), and scale
+      each element by the learned scale vector.  Cost: ~650 scalar float
+      ops per row &times; B rows &asymp; 25&nbsp;&mu;s at M=48, K=128.</li>
+  <li><strong>Matmul + ReLU</strong> (vectorised bf16): The 2&times;2 tile
+      expansion described above, with ReLU fused into the store step.
+      At the end: <code>store(max(acc.to_vector(), zeros))</code>.</li>
+</ol>
+
+<p>
+The key implementation detail: weights and scale share one buffer.
+The weight matrix (H&times;H = 32&nbsp;KB in bf16 tiled layout) occupies
+the first H&times;H elements, and the scale vector (H elements = 256 bytes)
+is appended after it.  The kernel extracts the scale pointer:
+</p>
+<pre>
+const bfloat16 *scale = w_and_scale + DIM_K * DIM_N;
+rms_norm_inplace(input, scale);    // step 1: normalise in-place
+matmul_relu_2x2(input, w, output); // step 2: matmul + ReLU
+</pre>
+
+<h3>3.4 IRON: the Python programming model</h3>
+
+<p>
+<a href="#g-iron" class="gref">IRON</a> is a Python API that lets you describe
+<em>what</em> each tile computes and <em>how</em> data moves between tiles,
+without writing any MLIR or assembly by hand.  The IRON compiler translates
+your Python program into MLIR-AIE, then into the binary
+<a href="#v-bitstream" class="gref">bitstream</a> (<code>.xclbin</code>) and
+instruction sequence (<code>.bin</code>) that configure the hardware.
+</p>
+
+<h4><code>ObjectFifo</code>: explicit data channels</h4>
+<p>
+The most important abstraction.  An ObjectFifo is a hardware queue between
+a producer tile and a consumer tile:
+</p>
+<pre>
+fifo = ObjectFifo(buffer_type, name="my_fifo", depth=1)
+</pre>
+<p>
+The <code>depth</code> is how many buffers are in the queue (depth=1 means
+single-buffering; depth=2 gives
+<a href="#v-doublebuf" class="gref">double buffering</a>).
+Each end has two operations:
+</p>
+<ul>
+  <li><code>fifo.prod()</code> / <code>fifo.cons()</code> &mdash;
+      get the producer or consumer endpoint.</li>
+  <li><code>acquire(n)</code> / <code>release(n)</code> &mdash;
+      <strong>blocking</strong> acquire (wait until n buffers are available)
+      and release (signal the other end that n buffers are done).
+      This is the <em>only</em> synchronisation mechanism between tiles.</li>
+</ul>
+
+<p>
+Three routing operations handle the MemTile as an on-chip switch:
+</p>
+<ul>
+  <li><code>.forward()</code> &mdash; pass data through MemTile unchanged
+      (DDR input &rarr; MemTile &rarr; compute tile).</li>
+  <li><code>.split(offsets, types)</code> &mdash; one large buffer arriving
+      at MemTile is sliced into N smaller buffers distributed to N tiles.
+      Used for distributing per-stage weights from a single DDR transfer.</li>
+  <li><code>.join(offsets, types)</code> &mdash; the reverse of split:
+      N tiles&rsquo; outputs are gathered into one large buffer for DDR.</li>
+</ul>
+
+<div class="highlight">
+<strong>ObjectFIFO &rlarr; hardware mapping:</strong> Each ObjectFifo compiles
+to a pair of <a href="#g-bd" class="gref">buffer descriptors</a> (BDs) in
+the DMA engines of the producer and consumer tiles.  The BDs describe the
+memory addresses, sizes, and stride patterns.  The <code>acquire/release</code>
+calls become hardware lock operations: a tile stalls until the BD signals data
+is ready.  There is zero software overhead at runtime.
+</div>
+
+<h4><code>Kernel</code>: compiled C++ function reference</h4>
+<pre>
+mm_relu = Kernel(
+    "norm_matmul_relu_bf16_bf16",   # C function name (extern "C")
+    "mlp_kernels.a",                # compiled library
+    [act_type, weight_type, act_type]  # argument types
+)
+</pre>
+<p>
+A Kernel object is just a <em>reference</em> to a compiled C++ function.
+It tells IRON what to link onto each tile.  The argument types must match the
+ObjectFifo buffer types.
+</p>
+
+<h4><code>Worker</code>: one function per tile</h4>
+<pre>
+def stage_body(of_in, of_out, of_w, mm_relu_fn):
+    x = of_in.acquire(1)       # wait for input
+    y = of_out.acquire(1)      # wait for output buffer
+    w = of_w.acquire(1)        # wait for weights
+    mm_relu_fn(x, w, y)        # compute: y = ReLU(RMSNorm(x) @ W)
+    of_w.release(1)
+    of_in.release(1)
+    of_out.release(1)          # signal output ready
+
+Worker(stage_body,
+       fn_args=[in_fifo.cons(), out_fifo.prod(), wt_fifo.cons(), mm_relu],
+       placement=Tile(col=0, row=2))
+</pre>
+<p>
+A Worker binds a Python function to a specific physical tile.  The function
+describes the tile&rsquo;s behaviour: acquire inputs from FIFOs, call the
+kernel, release outputs.  IRON compiles this into the tile&rsquo;s instruction
+sequence.  Each tile gets exactly one Worker.
+</p>
+
+<h4><code>Runtime</code>: host&ndash;device orchestration</h4>
+<p>
+The Runtime describes what the host CPU does: load data into the NPU,
+start the workers, and drain results back:
+</p>
+<pre>
+rt = Runtime()
+with rt.sequence(input_type, weight_type, output_type) as (inp, wts, out):
+    rt.start(*workers)          # launch all 32 workers (they block on FIFOs)
+    tg = rt.task_group()
+    for col in range(8):
+        rt.fill(ddr_in[col].prod(), inp, tap, task_group=tg)   # DMA: host &rarr; tile
+    rt.finish_task_group(tg)
+    # ... fill weights, drain outputs similarly
+</pre>
+<p>
+<code>task_group()</code> groups multiple DMA transfers that execute in
+parallel (e.g., all 8 columns fill simultaneously).
+<code>TensorAccessPattern</code> (TAP) objects describe how to slice the
+host buffer into per-column chunks:
+</p>
+<pre>
+tap = TensorAccessPattern(
+    (1, total_size),    # shape of the host buffer
+    col * B * H,        # offset: start of this column's slice
+    [1, 1, B, H],       # logical shape for DMA iteration
+    [0, 0, H, 1],       # strides
+)
+</pre>
+
+<h4><code>Program</code>: putting it all together</h4>
+<pre>
+program = Program(NPU2(), rt)
+mlir_module = program.resolve_program(SequentialPlacer())
+</pre>
+<p>
+<code>NPU2()</code> selects the XDNA&nbsp;2 hardware target (8&nbsp;columns,
+4&nbsp;compute rows).  <code>SequentialPlacer()</code> assigns Workers to
+tiles in order.  The <code>resolve_program</code> call generates the complete
+MLIR-AIE module, which is then compiled to the final
+<code>.xclbin</code> bitstream and <code>.bin</code> instruction file.
+</p>
+
+<h3>3.5 Design patterns for the NPU</h3>
+
+<p>
+With the hardware and programming model understood, here are the key patterns
+for mapping computation graphs onto the tile array.
+</p>
+
+<h4>Pattern 1: Column parallelism (data-parallel batching)</h4>
+<p>
+All 8 columns are identical and independent: they run the same kernel on
+different slices of the input batch.  If you have B&nbsp;samples per column,
+the total batch is 8&times;B.  This is pure data parallelism &mdash; no
+communication between columns.  Each column has its own set of ObjectFIFOs
+and its own weight copy in tile SRAM.
+</p>
+<p>
+<strong>When to use:</strong> Always, for throughput.  8 columns &times; B
+samples per column amortises the ~120&nbsp;&mu;s XRT invocation overhead
+across 8&times;B results.
+</p>
+
+<h4>Pattern 2: Row pipelining (sequential stages)</h4>
+<p>
+Within each column, the 4 compute rows form a pipeline.  Data flows from
+row&nbsp;2 &rarr; row&nbsp;3 &rarr; row&nbsp;4 &rarr; row&nbsp;5 through
+tile-to-tile ObjectFIFOs (no MemTile hop, zero-copy).  Each row applies a
+different transformation (different weight matrix).  The pipeline behaviour
+emerges naturally from FIFO blocking: row&nbsp;3&rsquo;s
+<code>acquire()</code> stalls until row&nbsp;2&rsquo;s
+<code>release()</code> signals output is ready.
+</p>
+<p>
+<strong>When to use:</strong> For deep, sequential computation (stacked layers).
+Each pipeline stage adds one more learnable transformation without any DDR
+round-trip.
+</p>
+
+<h4>Pattern 3: Weight-stationary execution</h4>
+<p>
+The weight matrix stays in tile SRAM for the entire NPU invocation.  Only
+activations stream through the tile (one input buffer in, one output buffer
+out).  This is the optimal strategy when:
+</p>
+<ul>
+  <li>The weight matrix fits in SRAM (our 128&times;128 matrix = 32&nbsp;KB
+      &lt; 64&nbsp;KB per tile).</li>
+  <li>The same weights are applied to many input samples (batch processing).</li>
+</ul>
+<p>
+The alternative (activation-stationary, streaming weights) is needed when
+weights exceed tile SRAM &mdash; but then the operation becomes memory-bandwidth
+limited and the NPU loses its advantage over the CPU.
+</p>
+
+<h4>Pattern 4: SRAM budget planning</h4>
+<p>
+Every design starts with this calculation.  For our architecture (H=128,
+B=48, BFP16 mode):
+</p>
+<table>
+  <tr><th>Component</th><th>Size (bytes)</th><th>Notes</th></tr>
+  <tr><td>Weight matrix W</td><td>128&times;128&times;2 = 32,768</td>
+      <td>bf16, 8&times;8 tiled layout</td></tr>
+  <tr><td>Scale vector</td><td>128&times;2 = 256</td>
+      <td>bf16, flat (appended to W)</td></tr>
+  <tr><td>Input activation buffer</td><td>48&times;128&times;2 = 12,288</td>
+      <td>bf16, one batch</td></tr>
+  <tr><td>Output activation buffer</td><td>48&times;128&times;2 = 12,288</td>
+      <td>bf16, one batch</td></tr>
+  <tr><td>Stack + code locals</td><td>~1,500</td><td>Estimated</td></tr>
+  <tr style="font-weight:600;">
+      <td>Total</td><td>~59,100 (57.7 KB)</td>
+      <td>Fits in 64 KB &check;</td></tr>
+</table>
+<p>
+This budget leaves ~6&nbsp;KB of headroom.  Increasing H to 192 would need
+192&times;192&times;2 = 72&nbsp;KB for weights alone &mdash; over the 64&nbsp;KB
+limit.  This is why H=128 is the maximum hidden dimension for single-tile
+weight-stationary execution in bf16.
+</p>
+
+<h4>Pattern 5: Kernel fusion</h4>
+<p>
+Unfused operations (separate kernels for norm, matmul, and relu) require
+three DMA round-trips per stage, three kernel invocations, and three sets
+of buffers.  Fusing them into one kernel:
+</p>
+<ul>
+  <li>Eliminates intermediate buffers (input is normalised in-place).</li>
+  <li>Keeps data in registers between operations.</li>
+  <li>Reduces the number of Worker <code>acquire/release</code> cycles.</li>
+  <li>Allows the compiler to pipeline the norm reduction with the matmul
+      loads.</li>
+</ul>
+<p>
+In our benchmarks, the fused <code>matmul_relu</code> kernel achieved
+<strong>23.93 <a href="#g-tflops" class="gref">TFLOPS</a></strong> (95.7%
+of peak) versus 15.98 TFLOPS unfused at B=48 &mdash; a 50% throughput
+improvement from fusion alone.
+</p>
+
+<h4>Pattern 6: Amortising invocation overhead</h4>
+<p>
+Every NPU call has ~120&nbsp;&mu;s of <a href="#g-xrt" class="gref">XRT</a>
+driver overhead.  If each call does only one matmul (~1&nbsp;&mu;s of
+compute), you waste 99% of time on overhead.  Solutions:
+</p>
+<ul>
+  <li><strong>Large batches:</strong> B=48 means 48 rows of 128 multiplied
+      per tile, 24&times; more work per call than B=2.</li>
+  <li><strong>Deep pipelines:</strong> 4 stages per call means 4 matmuls
+      of compute for one overhead.</li>
+  <li><strong>Hardware loops:</strong> For throughput benchmarks (not
+      autoregressive generation), a <code>range_(N)</code> loop repeats
+      the computation N times <em>on-chip</em> before returning to the host.
+      At N=1000, compute completely dominates overhead.</li>
+</ul>
+
+<h3>3.6 Hardware constraints and gotchas</h3>
+
+<p>
+The NPU has several constraints that are not obvious from high-level
+descriptions.  We discovered each of these through trial and error during
+development.
+</p>
+
+<h4>Buffer descriptor size limit (10-bit fields)</h4>
+<p>
+The <a href="#g-dma" class="gref">DMA</a> engines in
+<a href="#v-shim" class="gref">shim tiles</a> use
+<a href="#g-bd" class="gref">buffer descriptors</a> with 10-bit size fields,
+meaning each dimension of a
+<code>TensorAccessPattern</code> must be &le;&nbsp;1024.  If your tensor has
+a dimension larger than 1024 (e.g., B&times;H = 48&times;128 = 6144), you must
+factor it: use shape <code>[tiles_per_col,&thinsp;B,&thinsp;H]</code> instead
+of <code>[tiles_per_col,&thinsp;B*H]</code>.  The compiler will reject designs
+that violate this, with the cryptic error
+<code>&ldquo;Size 0 exceeds [0:1023] range&rdquo;</code>.
+</p>
+
+<h4>MemTile routing limits</h4>
+<p>
+Each MemTile has approximately 6 master ports going northward (toward compute
+rows).  A multi-row design that uses <code>split()</code> + <code>forward()</code>
++ <code>join()</code> consumes 3 FIFOs per row of compute tiles.  This means:
+</p>
+<ul>
+  <li><strong>3 compute rows</strong> (24 tiles) works reliably:
+      3&times;3 = 9 FIFOs, within limits.</li>
+  <li><strong>4 compute rows</strong> (32 tiles) sometimes fails with
+      <code>&ldquo;Unable to find a legal routing&rdquo;</code>,
+      depending on the FIFO topology.</li>
+</ul>
+<p>
+Our design uses all 4 compute rows by routing inter-tile activations
+<em>directly tile-to-tile</em> (not through MemTile), reserving MemTile
+ports for DDR-facing traffic only (weight split, activation forward/join).
+</p>
+
+<h4>ShimDMA channel limits</h4>
+<p>
+There are 16 ShimDMA channels total (2 per column).  Each DDR-facing
+ObjectFifo consumes one channel.  With 8 columns, our design uses 3
+DDR FIFOs per column (input, weight, output) = 24, but the compiler
+shares channels across task groups that don&rsquo;t overlap in time.
+Exceeding 16 <em>simultaneous</em> channels causes compilation failure.
+</p>
+
+<h4>ObjectFIFO acquire/release inside loops</h4>
+<p>
+Placing <code>acquire()</code> and <code>release()</code> calls inside an
+IRON <code>range_(N)</code> hardware loop can cause deadlocks: the tile&rsquo;s
+DMA and compute core enter a circular dependency where each waits for the
+other.  The fix: acquire all FIFOs <em>before</em> the loop, put only kernel
+calls inside, and release <em>after</em> the loop.  This was the most subtle
+bug we encountered and caused silent hardware timeouts
+(<code>ERT_CMD_STATE_TIMEOUT</code>) with no diagnostic output.
+</p>
+
+<h4>Tiled memory layout</h4>
+<p>
+The MMUL hardware expects weight matrices in <strong>blocked (tiled)
+format</strong>: the matrix is divided into 8&times;8 sub-matrices stored
+contiguously, rather than row-major order.  A 128&times;128 matrix becomes
+16&times;16 blocks of 64 elements each.  Host-side code must convert with
+<code>to_tiled()</code> before sending weights to the NPU, and
+<code>from_tiled()</code> to interpret results.  Forgetting this conversion
+produces silently wrong results, not errors.
+</p>
+
+<h3>3.7 Putting it all together</h3>
+
+<p>
+Let&rsquo;s trace how these pieces combine to build a complete NPU design,
+starting small and scaling up.
+</p>
+
+<h4>Step 1: Single-tile matmul</h4>
+<p>
+The simplest possible design: one tile, one weight matrix, one input, one
+output.  Two ObjectFIFOs (in, out), one Kernel, one Worker.  The host fills
+the input FIFO, the tile computes <code>y&thinsp;=&thinsp;ReLU(x&thinsp;@&thinsp;W)</code>,
+and the host drains the output.  This uses 1 of 32 tiles and achieves ~1/32
+of peak throughput, but it validates the kernel and data layout.
+</p>
+
+<h4>Step 2: Column parallelism (8 tiles)</h4>
+<p>
+Replicate the single-tile design across 8 columns. Each column gets its own
+ObjectFIFOs and Worker, processing a different batch slice.  The Runtime uses
+<code>task_group()</code> to issue 8 parallel DMA fills.  Throughput scales
+linearly: 8&times; the single-tile result.
+</p>
+
+<h4>Step 3: Row pipelining (4&times;8 = 32 tiles)</h4>
+<p>
+Add 3 more rows per column.  Inter-tile FIFOs chain the stages:
+row&nbsp;2&rsquo;s output feeds row&nbsp;3&rsquo;s input, and so on.
+Weights are distributed via <code>.split()</code> through the MemTile.
+Now each NPU call applies 4 sequential transformations &mdash; equivalent
+to 4 layers of a neural network.
+</p>
+
+<h4>Step 4: Host-orchestrated depth (8 blocks &times; 4 stages = 32 layers)</h4>
+<p>
+The host calls the NPU 8 times, each time loading a different set of 4 weight
+matrices.  Between calls, the CPU applies normalisation and residual
+connections.  The result is a 32-layer model running on 32 tiles, with the
+architecture described in the next section.
+</p>
+
+<div class="key-insight">
+<strong>Design methodology:</strong> Start with one tile, get it working,
+then scale horizontally (columns) for throughput and vertically (rows) for
+depth.  Each scaling step adds hardware resources without changing the
+per-tile kernel.  The host orchestration layer (IRON Runtime) manages the
+increasing complexity.
+</div>
+
+<h2>5. The Architecture: Block-Recurrent Character LM</h2>
 
 <p>
 We build a character-level language model whose architecture is dictated by the
@@ -712,7 +1297,7 @@ that the pipeline cannot: normalisation, embedding injection, and residual
 connections.
 </p>
 
-<h3>4.1 The block-recurrent computation</h3>
+<h3>5.1 The block-recurrent computation</h3>
 
 <p>
 For each character in the input sequence, the model updates a hidden state
@@ -754,7 +1339,7 @@ After all 8 blocks, a final RMSNorm and a linear readout produce a probability
 distribution over the ~65-character vocabulary.
 </p>
 
-<h3>4.2 NPU tile mapping</h3>
+<h3>5.2 NPU tile mapping</h3>
 
 <p>
 The model uses all 32 compute tiles in an 8-column &times; 4-row layout:
@@ -784,7 +1369,7 @@ Column 0        Column 1        ...  Column 7
       CPU loads the appropriate block&rsquo;s weights before each NPU call.</li>
 </ul>
 
-<h3>4.3 Why this architecture</h3>
+<h3>5.3 Why this architecture</h3>
 
 <p>
 Every architectural choice follows from a hardware constraint:
@@ -812,7 +1397,7 @@ Every architectural choice follows from a hardware constraint:
       <a href="#g-xrt" class="gref">XRT</a> driver overhead per NPU call.</li>
 </ul>
 
-<h3>4.4 Fusing normalisation into the pipeline</h3>
+<h3>5.4 Fusing normalisation into the pipeline</h3>
 
 <p>
 The key innovation is a custom NPU kernel that fuses three operations &mdash;
@@ -856,7 +1441,7 @@ block structure that runs on the NPU. There is no &ldquo;compilation&rdquo; step
 that approximates a richer model for hardware. What you train is what you deploy.
 </div>
 
-<h3>4.5 Making it trainable</h3>
+<h3>5.5 Making it trainable</h3>
 
 <p>
 Simply stacking 32 layers of ReLU(h&nbsp;&times;&nbsp;W&nbsp;+&nbsp;b) does not
@@ -885,9 +1470,9 @@ three techniques (explained in
       the recurrent dynamics stable.</li>
 </ul>
 
-<h2>5. Results</h2>
+<h2>6. Results</h2>
 
-<h3>5.1 Language model quality</h3>
+<h3>6.1 Language model quality</h3>
 
 <p>
 The block-recurrent model was trained on the tiny Shakespeare dataset (1.1 MB,
@@ -914,7 +1499,7 @@ The model produces recognisable Shakespearean English with a 542K-parameter
 model trained on 1 MB of text.
 </p>
 
-<h3>5.2 NPU inference performance</h3>
+<h3>6.2 NPU inference performance</h3>
 
 <table>
   <tr><th>Metric</th><th>Value</th></tr>
@@ -935,7 +1520,7 @@ overhead across hundreds of sequences. The CPU overhead between NPU calls
 normalisation is now handled on-chip by the fused kernel.
 </p>
 
-<h3>5.3 What limits throughput</h3>
+<h3>6.3 What limits throughput</h3>
 
 <p>
 Each NPU call performs only 4 matmuls of size 48&times;128&times;128 &mdash;
@@ -960,7 +1545,7 @@ correctness of the hardware mapping; throughput optimisation (larger hidden
 dimensions, fewer blocks, quantisation) is future work.
 </div>
 
-<h2>6. The Toolchain</h2>
+<h2>7. The Toolchain</h2>
 
 <table>
   <tr><th>Component</th><th>Role</th></tr>
@@ -974,7 +1559,7 @@ dimensions, fewer blocks, quantisation) is future work.
       <td>Runtime for loading and executing on the NPU</td></tr>
 </table>
 
-<h3>6.1 Compilation pipeline</h3>
+<h3>7.1 Compilation pipeline</h3>
 
 <pre>
 design.py  &xrarr;  MLIR  &xrarr;  aiecc  &xrarr;  .xclbin (bitstream)
@@ -984,7 +1569,7 @@ norm_matmul_relu.cc &xrarr;  mlp_norm_mm_relu.o &xrarr;  mlp_kernels.a
 mlp_kernels.cc     &xrarr;  mlp_copy.o         &nearr;
 </pre>
 
-<h2>7. Code Structure</h2>
+<h2>8. Code Structure</h2>
 
 <p>
 The project is intentionally minimal &mdash; four Python files and two C++ files:
@@ -1023,7 +1608,7 @@ The spatial MLP module (<code>spatial_mlp/</code>) provides the NPU pipeline
 infrastructure used by the generator for on-device inference.
 </p>
 
-<h2>8. Future Work</h2>
+<h2>9. Future Work</h2>
 
 <ul>
   <li><strong><a href="#g-int8" class="gref">INT8</a> mode:</strong> The

@@ -130,6 +130,8 @@ def main():
     parser.add_argument("--wiki-chars", type=int, default=10_000_000,
                         help="Max raw chars for wikipedia dataset (default: 10M)")
     parser.add_argument("--device", type=str, default="auto")
+    parser.add_argument("--resume", action="store_true",
+                        help="Resume from latest checkpoint")
     args = parser.parse_args()
 
     if args.device == "auto":
@@ -173,6 +175,19 @@ def main():
     print(f"Model:      {args.n_layers}L, {args.d_model}d, {args.n_heads}h, "
           f"{args.d_ff}ff")
     print(f"Parameters: {params:,}")
+
+    # Resume from checkpoint if requested
+    start_epoch = 0
+    if args.resume:
+        ckpt_file = CHECKPOINT_DIR / f"{args.dataset}_transformer_checkpoint.pt"
+        if ckpt_file.exists():
+            ckpt = torch.load(ckpt_file, map_location=device, weights_only=False)
+            model.load_state_dict(ckpt["model_state"])
+            start_epoch = ckpt.get("epoch", 0)
+            print(f"Resumed from {ckpt_file} (epoch {start_epoch}, "
+                  f"val_loss={ckpt.get('val_loss', '?')})")
+        else:
+            print(f"No checkpoint found at {ckpt_file}, starting fresh")
     print()
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
@@ -185,7 +200,7 @@ def main():
     total_batches = len(train_loader)
     save_every = max(200, total_batches // 5)
 
-    def _save(val_loss=None, train_loss=None):
+    def _save(val_loss=None, train_loss=None, epoch=None):
         torch.save({
             "model_state": {k: v.cpu() for k, v in model.state_dict().items()},
             "vocab_chars": vocab.chars,
@@ -196,6 +211,7 @@ def main():
             },
             "val_loss": val_loss,
             "train_loss": train_loss,
+            "epoch": epoch,
         }, ckpt_path)
 
     # MLflow tracking
@@ -220,8 +236,8 @@ def main():
             "epochs": args.epochs,
         })
 
-        global_step = 0
-        for epoch in range(1, args.epochs + 1):
+        global_step = start_epoch * total_batches
+        for epoch in range(start_epoch + 1, args.epochs + 1):
             t0 = time.time()
 
             # Train
@@ -248,7 +264,7 @@ def main():
                           flush=True)
 
                 if num_batches % save_every == 0:
-                    _save(train_loss=total_loss / num_batches)
+                    _save(train_loss=total_loss / num_batches, epoch=epoch)
                     print(f"    batch {num_batches:4d} | mid-epoch checkpoint"
                           f" saved", flush=True)
 
@@ -281,7 +297,7 @@ def main():
             marker = ""
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
-                _save(val_loss=val_loss, train_loss=train_loss)
+                _save(val_loss=val_loss, train_loss=train_loss, epoch=epoch)
                 marker = " ← saved"
 
             print(f"Epoch {epoch:3d}/{args.epochs} | "
