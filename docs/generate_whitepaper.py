@@ -168,14 +168,14 @@ and non-linearities (<a href="#g-relu" class="gref">ReLU</a>), but its structure
 
 <p>
 Our main result is a <strong>block-recurrent character language model</strong>
-with 32 layers grouped into 8 blocks of 4. Each block maps to a 4-stage pipeline
-on the NPU (one layer per compute row, 8 columns in parallel). The model achieves
-validation loss 2.42 (perplexity 11.2) on Shakespeare text and generates
-89,600 characters/second on the NPU. In a supporting throughput benchmark,
-a recurrent <a href="#g-mlp" class="gref">MLP</a> with a single shared weight
-achieves <strong>23.93 <a href="#g-tflops" class="gref">TFLOPS</a></strong>
-sustained &mdash; 95.7% of the 25 TFLOPS theoretical peak and
-<strong>26&times; speedup over CPU</strong>.
+that generates Shakespeare-like text entirely on the NPU. The model has 32
+layers grouped into 8 blocks of 4. Each block maps to a 4-stage pipeline
+on the NPU (one layer per compute row, 8 columns in parallel). Between
+blocks, the CPU applies normalisation, character-embedding injection, and
+residual connections &mdash; the same operations the model uses during training.
+The result: <strong>89,600 characters/second</strong> on 32 NPU tiles, with
+the trained weights producing <em>identical</em> computation on hardware
+&mdash; no approximations, no graph compilation, no operator fallback.
 </p>
 
 <div class="key-insight">
@@ -529,12 +529,124 @@ With this background, the rest of the paper should be accessible:
 <ul>
   <li><strong>Section 3</strong> describes the physical hardware: the tile
       grid, memory sizes, and interconnect.</li>
-  <li><strong>Section 4</strong> presents the neural network architecture and
-      explains why each design choice follows from the hardware constraints.</li>
-  <li><strong>Section 5</strong> shows throughput and speedup results.</li>
+  <li><strong>Section 4</strong> presents the neural network architecture:
+      block-recurrent character language model mapped to the NPU pipeline.</li>
+  <li><strong>Section 5</strong> shows quality and throughput results.</li>
   <li><strong>Section 6</strong> describes the software toolchain.</li>
   <li><strong>Section 7</strong> maps the code structure to the concepts.</li>
 </ul>
+
+<h3 id="s-nn-fundamentals">2.7 Neural network fundamentals (for hardware engineers)</h3>
+
+<p>
+If you work in hardware or systems and have heard &ldquo;neural network&rdquo;
+but never implemented one, this section gives you just enough to follow the
+architecture decisions in this paper.
+</p>
+
+<h4>What is a neural network?</h4>
+<p>
+A neural network is a function built by stacking <strong>layers</strong>.
+Each layer applies a linear transformation (matrix multiply) followed by a
+<strong>non-linearity</strong> (a simple element-wise function). For example:
+</p>
+
+<pre>
+y = ReLU(x @ W + b)      # one layer
+</pre>
+
+<p>
+Here <code>x</code> is the input vector, <code>W</code> is a learnable
+<strong>weight matrix</strong>, <code>b</code> is a learnable
+<strong>bias vector</strong>, and
+<a href="#g-relu" class="gref">ReLU</a>(z)&nbsp;=&nbsp;max(z,&nbsp;0) is the
+non-linearity. Without the non-linearity, stacking layers would collapse to
+a single matrix multiply &mdash; the non-linearity is what gives depth its
+power. Stacking many such layers creates a &ldquo;deep&rdquo; network that
+can learn increasingly abstract representations of its input.
+</p>
+
+<h4>Language models: predicting the next character</h4>
+<p>
+A <strong>language model</strong> assigns probabilities to sequences of text.
+The simplest version predicts the next character (or word) given everything
+that came before. If the model has read &ldquo;KING RICHAR&rdquo;, it should
+assign high probability to &ldquo;D&rdquo;. At generation time, we sample
+from this probability distribution to produce text one character at a time.
+</p>
+
+<p>
+The quality of a language model is measured by <strong>cross-entropy loss</strong>
+&mdash; roughly, how surprised the model is by each character in a held-out
+test set. Lower is better. The related metric
+<strong>perplexity</strong>&nbsp;=&nbsp;e<sup>loss</sup> can be interpreted
+as &ldquo;the model is as confused as if choosing uniformly among <em>N</em>
+options.&rdquo; A perplexity of 11 means the model is, on average, as uncertain
+as if it were picking among 11 equally likely characters (out of ~65 in our
+vocabulary).
+</p>
+
+<h4>Recurrence: memory across time</h4>
+<p>
+A <strong>recurrent</strong> network maintains a <strong>hidden state</strong>
+<code>h</code> that carries information from one time step to the next:
+</p>
+
+<pre>
+h = f(h, embed(char))     # update hidden state with new character
+logits = h @ W_out + b    # predict next character from hidden state
+</pre>
+
+<p>
+The function <code>f</code> reads the previous hidden state and the current
+character&rsquo;s <strong>embedding</strong> (a learned vector that represents
+each character as a point in continuous space), and produces a new hidden state.
+This is fundamentally different from feedforward networks that process each
+input independently: the hidden state acts as the model&rsquo;s
+&ldquo;memory&rdquo; of everything it has read so far.
+</p>
+
+<h4>Making deep networks trainable</h4>
+<p>
+Simply stacking 32 layers of <code>h = ReLU(h @ W + b)</code> does not work:
+the hidden state either explodes to infinity or collapses to zero as it
+passes through many layers. Three techniques solve this:
+</p>
+
+<ul>
+  <li><strong>Residual connections:</strong> Instead of <code>h = f(h)</code>,
+      compute <code>h = h + f(h)</code>. The identity &ldquo;shortcut&rdquo;
+      ensures that gradients can flow backwards through the network even if
+      <code>f</code> has very small gradients. This was the key innovation
+      behind deep learning&rsquo;s leap from ~10 to ~100+ layer networks.</li>
+  <li><strong>Normalisation (RMSNorm):</strong> Before each layer, rescale the
+      hidden state to have unit root-mean-square:
+      <code>h / sqrt(mean(h&sup2;) + &epsilon;)</code>. This prevents the
+      activations from growing exponentially across layers or time steps.</li>
+  <li><strong>Input injection:</strong> Add the character embedding at every
+      layer (not just the first), so each layer can directly access the current
+      input rather than relying on information that has been progressively
+      transformed and potentially diluted by many preceding layers.</li>
+</ul>
+
+<h4 id="s-bptt">Training: learning by gradient descent</h4>
+<p>
+The weight matrices start with random values. <strong>Training</strong> means
+repeatedly: (1) run the model on a batch of text, (2) compute how wrong the
+predictions are (the loss), (3) compute the gradient of the loss with respect
+to every weight (using <strong>backpropagation</strong> &mdash; the chain
+rule applied systematically through the network), and (4) nudge each weight
+in the direction that reduces the loss. For recurrent networks, this is called
+<strong>backpropagation through time (BPTT)</strong> because gradients flow
+backwards through both layers and time steps.
+</p>
+
+<p>
+Training typically happens on a GPU because GPUs have massive memory bandwidth
+and can process large batches in parallel. The NPU enters at
+<strong>inference</strong> time: once the weights are learned, we deploy the
+trained model to the NPU for fast, efficient text generation.
+</p>
 
 <h2>3. The Hardware</h2>
 
@@ -582,279 +694,263 @@ for deep, narrow computations.
 </p>
 
 <div class="highlight">
-<strong>Lesson from Phase 1:</strong> A single large <a href="#g-gemm" class="gref">GEMM</a>
+<strong>Why on-chip matters:</strong> A single large <a href="#g-gemm" class="gref">GEMM</a>
 achieves only 2.49 TFLOPS on the NPU (10% of peak) because it is
 <em>memory-bandwidth limited</em> &mdash; data must stream from DDR. The NPU
-wins when data <strong>stays on-chip</strong>.
+wins when data <strong>stays on-chip</strong>. Our architecture keeps weights
+in tile SRAM and passes activations tile-to-tile through FIFOs.
 </div>
 
-<h2>4. The Architecture</h2>
-
-<h3>4.1 Throughput benchmark: Recurrent MLP</h3>
+<h2>4. The Architecture: Block-Recurrent Character LM</h2>
 
 <p>
-Our first architecture is a recurrent <a href="#g-mlp" class="gref">MLP</a>:
-a single weight matrix <code>W</code> (128&times;128,
-<a href="#g-bf16" class="gref">bfloat16</a>) is loaded once into each tile's
-<a href="#g-sram" class="gref">SRAM</a> and applied repeatedly in a tight
-hardware loop. A <strong>fused <a href="#v-kernel" class="gref">kernel</a></strong>
-computes C&nbsp;=&nbsp;<a href="#g-relu" class="gref">ReLU</a>(A&nbsp;&times;&nbsp;B)
-in a single call:
+We build a character-level language model whose architecture is dictated by the
+NPU&rsquo;s physical tile array. The model has 32 layers (one per compute tile),
+grouped into 8 blocks of 4 layers (one block per column). Each block maps to
+a single NPU pipeline call. Between blocks, the CPU applies the operations
+that the pipeline cannot: normalisation, embedding injection, and residual
+connections.
 </p>
 
-<pre>
-x = input                     # loaded from DDR, 48&times;128 bf16
-for i in range(num_iters):
-    y = ReLU(x @ W)           # fused matmul + activation (one kernel call)
-    x = ReLU(y @ W)           # ping-pong: result goes back to x
-output = x                    # drained to DDR
-</pre>
+<h3>4.1 The block-recurrent computation</h3>
 
 <p>
-This is mapped to 24 compute tiles (3 rows &times; 8 columns), each running the
-same loop independently on different input samples:
-</p>
-
-<div class="figure">
-  <img src="recurrent_mlp.png" alt="Recurrent MLP mapped to NPU">
-  <div class="caption">
-    Figure 2: Recurrent MLP mapped to the XDNA&nbsp;2 tile array. 24 tiles across
-    3 compute rows run the same hardware loop in parallel. Row 5 is unused due to
-    MemTile routing constraints (~6 northward master ports). The detail box shows
-    the per-tile computation: acquire buffers, loop, copy result.
-  </div>
-</div>
-
-<h3>4.2 Main model: Block-Recurrent Character LM</h3>
-
-<p>
-The recurrent MLP demonstrates near-peak throughput but uses a single shared weight
-matrix &mdash; too simple for a real ML task. The <strong>block-recurrent</strong>
-architecture extends this with 32 <em>distinct</em> weight matrices, grouped into
-8 blocks of 4 layers. Each block maps to one NPU pipeline call (4 rows in one column).
-Between blocks, the CPU applies normalization, embedding injection, and residual
-connections:
+For each character in the input sequence, the model updates a hidden state
+<code>h</code> (a 128-dimensional <a href="#g-bf16" class="gref">bfloat16</a>
+vector) through 8 blocks:
 </p>
 
 <pre>
 for each character:
     for each block g = 0..7:
-        CPU:  h_b = RMSNorm(h) + embed(char) + bias_g
-        NPU:  h_b = ReLU(ReLU(ReLU(ReLU(h_b @ W[4g]) @ W[4g+1]) @ W[4g+2]) @ W[4g+3])
-        CPU:  h = h + h_b   (residual connection)
-    CPU:  h = RMSNorm(h)       (post-norm)
-    CPU:  logits = h @ W_out + b_out
+        CPU:  h_b = RMSNorm(h) + embed(char) + bias_g       &larr; prepare input
+        NPU:  h_b = ReLU(  ReLU(  ReLU(  ReLU(
+                  h_b @ W[4g]
+              ) @ W[4g+1]
+            ) @ W[4g+2]
+          ) @ W[4g+3] )                                      &larr; 4-stage pipeline
+        CPU:  h = h + h_b                                    &larr; residual connection
+    CPU:  h = RMSNorm(h)                                     &larr; post-norm
+    CPU:  logits = h @ W_out + b_out                         &larr; predict next char
 </pre>
 
 <p>
-This design is a deliberate trade-off: per-layer normalization and input injection
-(which cannot run on the NPU pipeline) would give better quality (val loss 1.94)
-but require CPU intervention between every matmul. The blocked design sacrifices
-some quality (val loss 2.42) for exact NPU mapping &mdash; within each block,
-the 4-stage matmul+ReLU chain executes entirely in tile SRAM with no DDR traffic.
+Each of the 8 NPU calls runs a 4-stage matmul+ReLU pipeline:
 </p>
 
-<h3>4.3 Why these architectures</h3>
-
-<ul>
-  <li><strong>Maximizes on-chip time:</strong> Weight is loaded once (32 KB) and
-      reused for thousands of matmul operations. <a href="#g-ddr" class="gref">DDR</a>
-      I/O happens only at start and end.</li>
-  <li><strong>Amortizes overhead:</strong> Each NPU invocation has ~120 &mu;s of
-      driver/<a href="#g-dma" class="gref">DMA</a> overhead. With depth=1000,
-      compute time dominates overhead by &gt;10&times;.</li>
-  <li><strong>Fits <a href="#g-sram" class="gref">SRAM</a> budget:</strong>
-      W (32 KB) + 2 activation buffers (12 KB each at B=48) + stack (1 KB) =
-      57 KB, within the 64 KB tile limit. (B=64 would need 65 KB and fails.)</li>
-  <li><strong>Linear tile scaling:</strong> Each tile is independent &mdash;
-      doubling tiles doubles <a href="#v-throughput" class="gref">throughput</a>
-      with no communication overhead.</li>
-</ul>
-
-<h3>4.4 Multi-row data routing</h3>
+<ol>
+  <li>The CPU prepares the block input: normalise the hidden state, add the
+      character embedding and a per-block learned bias.</li>
+  <li>The prepared vector is sent to the NPU, where it passes through 4 tiles
+      in sequence. Each tile multiplies by its own weight matrix W<sub>i</sub>
+      (128&times;128) and applies <a href="#g-relu" class="gref">ReLU</a>,
+      using the fused <code>matmul_relu</code>
+      <a href="#v-kernel" class="gref">kernel</a>.</li>
+  <li>The NPU returns the result to the CPU, which adds it back to the hidden
+      state (residual connection).</li>
+</ol>
 
 <p>
-When using more than 8 tiles (i.e., more than one compute row), data must pass
-through the MemTiles (row 1) which act as routing hubs:
+After all 8 blocks, a final RMSNorm and a linear readout produce a probability
+distribution over the ~65-character vocabulary.
+</p>
+
+<h3>4.2 NPU tile mapping</h3>
+
+<p>
+The model uses all 32 compute tiles in an 8-column &times; 4-row layout:
+</p>
+
+<pre>
+Column 0        Column 1        ...  Column 7
+(samples 0-47)  (samples 48-95)      (samples 336-383)
+
+  Row 2: W&sub0;       Row 2: W&sub0;    ...    Row 2: W&sub0;      Stage 1
+  &darr;              &darr;                  &darr;
+  Row 3: W&sub1;       Row 3: W&sub1;    ...    Row 3: W&sub1;      Stage 2
+  &darr;              &darr;                  &darr;
+  Row 4: W&sub2;       Row 4: W&sub2;    ...    Row 4: W&sub2;      Stage 3
+  &darr;              &darr;                  &darr;
+  Row 5: W&sub3;       Row 5: W&sub3;    ...    Row 5: W&sub3;      Stage 4
+</pre>
+
+<ul>
+  <li><strong>8 columns</strong> process 8 independent batch slices in parallel,
+      48 samples each = 384 total.</li>
+  <li><strong>4 rows</strong> per column form a pipeline: data flows from row 2
+      to row 5 through <a href="#g-fifo" class="gref">ObjectFIFOs</a>,
+      tile-to-tile, with no <a href="#g-ddr" class="gref">DDR</a> traffic
+      between stages.</li>
+  <li>All 8 columns share the same 4 weight matrices for a given block. The
+      CPU loads the appropriate block&rsquo;s weights before each NPU call.</li>
+</ul>
+
+<h3>4.3 Why this architecture</h3>
+
+<p>
+Every architectural choice follows from a hardware constraint:
 </p>
 
 <ul>
-  <li><strong>Weights</strong> are <em>broadcast</em> via <code>forward()</code>:
-      one DDR&rarr;MemTile transfer, then the MemTile fans out to all compute
-      rows in the column.</li>
-  <li><strong>Inputs</strong> are <em>split</em> via <code>split()</code>: the
-      host buffer is partitioned so each row gets its own batch slice.</li>
-  <li><strong>Outputs</strong> are <em>joined</em> via <code>join()</code>: per-row
-      results are aggregated back through the MemTile to DDR.</li>
+  <li><strong>H=128:</strong> A 128&times;128 weight matrix occupies 32 KB in
+      <a href="#g-bf16" class="gref">bf16</a>. With two activation buffers
+      (48&times;128 = 12 KB each, <a href="#v-doublebuf" class="gref">double-buffered</a>)
+      and ~1 KB of stack, the total is 57 KB &mdash; within the 64 KB per-tile
+      <a href="#g-sram" class="gref">SRAM</a> limit.</li>
+  <li><strong>4 layers per block:</strong> The NPU has 4 compute rows.
+      A 4-stage pipeline uses one row per stage, fully utilizing the vertical
+      dimension.</li>
+  <li><strong>8 blocks:</strong> With 4 layers per block and 32 total layers,
+      8&nbsp;blocks = 32&nbsp;layers = 32&nbsp;tiles. This is the maximum depth
+      that maps cleanly to the hardware.</li>
+  <li><strong>B=48:</strong> The fused <code>matmul_relu</code> kernel
+      pipelines efficiently only when the outer loop has &ge;3 iterations:
+      M/(2r) &ge; 3, so B &ge; 48 for r&nbsp;=&nbsp;8.
+      (See <code>logbook.md</code> for the kernel fusion analysis.)</li>
+  <li><strong>384 parallel sequences:</strong> 8 columns &times; 48 samples
+      per column. Processing many sequences in parallel amortises the ~120 &mu;s
+      <a href="#g-xrt" class="gref">XRT</a> driver overhead per NPU call.</li>
 </ul>
 
-<div class="warning">
-<strong>Routing limit:</strong> Each MemTile has approximately 6 northward
-master ports. Our design requires 3 data streams per row (weight + input + output).
-At 3 compute rows = 9 streams, this fits; at 4 rows = 12 streams, the MLIR-AIE
-router fails. This caps us at <strong>24 tiles</strong> (3 rows &times; 8 columns).
+<h3>4.4 The hardware&ndash;quality trade-off</h3>
+
+<p>
+Our model architecture is shaped by a fundamental constraint: the NPU pipeline
+executes a pure chain of
+<a href="#g-relu" class="gref">ReLU</a>(x&nbsp;&times;&nbsp;W) operations
+with no CPU intervention between stages. But the best-quality version of the
+model applies normalisation and input injection at <em>every</em> layer &mdash;
+operations that require CPU processing between each matmul.
+</p>
+
+<p>
+This creates a trade-off:
+</p>
+
+<table>
+  <tr><th>Model variant</th><th>Val Loss</th><th>Perplexity</th>
+      <th>NPU-compatible?</th></tr>
+  <tr><td>Per-layer (norm + embed every layer)</td>
+      <td>1.94</td><td>6.9</td><td>No &mdash; CPU needed between every matmul</td></tr>
+  <tr style="background:#d4edda;font-weight:600;">
+      <td>Blocked (4-layer pure groups)</td>
+      <td>2.42</td><td>11.2</td><td>Yes &mdash; exact NPU mapping</td></tr>
+</table>
+
+<p>
+The blocked model sacrifices quality (perplexity 11.2 vs 6.9) for exact hardware
+mapping. Within each block, the 4-stage matmul+ReLU chain executes entirely in
+tile <a href="#g-sram" class="gref">SRAM</a> with no DDR traffic. Between
+blocks, the CPU handles the operations that need it: normalisation (RMSNorm),
+character embedding injection, bias addition, and residual connections.
+</p>
+
+<div class="key-insight">
+<strong>Design principle:</strong> We train the model with exactly the same
+block structure that runs on the NPU. There is no &ldquo;compilation&rdquo; step
+that approximates a richer model for hardware. What you train is what you deploy.
 </div>
 
-<h3>4.5 Critical implementation constraints</h3>
+<h3>4.5 Making it trainable</h3>
 
 <p>
-Several non-obvious hardware constraints shaped the design:
+Simply stacking 32 layers of ReLU(h&nbsp;&times;&nbsp;W&nbsp;+&nbsp;b) does not
+work: the hidden state either explodes to infinity or collapses to zero. We use
+three techniques (explained in
+<a href="#s-nn-fundamentals">Section 2.7</a>):
 </p>
 
 <ul>
-  <li><strong>No <a href="#g-fifo" class="gref">FIFO</a> ops inside loops:</strong>
-      Placing <code>acquire()</code> / <code>release()</code> inside
-      <code>range_()</code> (which compiles to <code>scf.for</code>) causes DMA
-      deadlock. All FIFO operations must happen <em>outside</em> the loop.</li>
-  <li><strong><a href="#g-bd" class="gref">DMA BD</a> 10-bit size limit:</strong>
-      <a href="#v-shim" class="gref">Shim</a> DMA buffer-descriptor sizes are
-      10-bit (max 1024). For B=48, H=128, the product B&times;H=6144 exceeds
-      this, so tensor access patterns must factor dimensions as [B, H] = [48, 128]
-      instead of [B&times;H] = [6144].</li>
-  <li><strong>Fused kernel requires sufficient batch size:</strong> Our
-      <code>matmul_relu</code> kernel fuses zero-init + matmul +
-      <a href="#g-relu" class="gref">ReLU</a> into one call, eliminating the need
-      for a separate zero pass. However, the chess compiler only schedules the
-      fused <a href="#v-pipeline" class="gref">pipeline</a> efficiently when the
-      outer loop has &ge;3 iterations (M/(2r) &ge; 3), meaning B &ge; 48 for
-      r=8. At B=16 (1 iteration), the fused kernel is actually 10% <em>slower</em>
-      than separate kernels.</li>
+  <li><strong>Pre-block RMSNorm:</strong> Before each block, normalise the
+      hidden state to unit RMS. This prevents the activations from growing
+      exponentially across the 8 blocks and across the 64-character sequence
+      during <a href="#s-bptt">backpropagation through time</a>.</li>
+  <li><strong>Residual connections:</strong> <code>h = h + block(h)</code>
+      after each block. Gradients flow backwards through the identity shortcut,
+      keeping training stable even at 32 layers.</li>
+  <li><strong>Input injection:</strong> The character embedding is added at
+      the start of every block, not just the first. This ensures each block
+      can directly access the current input, rather than relying on information
+      that has been progressively transformed by preceding blocks.</li>
+  <li><strong>Spectral norm clamping:</strong> During training, each weight
+      matrix is periodically rescaled so its largest singular value &le; 1.
+      This prevents any single layer from amplifying the hidden state, keeping
+      the recurrent dynamics stable.</li>
 </ul>
 
 <h2>5. Results</h2>
 
-<div class="figure">
-  <img src="performance.png" alt="Performance optimisation journey">
-  <div class="caption">
-    Figure 3: Optimisation journey showing
-    <a href="#g-tflops" class="gref">TFLOPS</a> throughput (left) and
-    CPU speedup (right) for each configuration. The fused kernel at B=48
-    achieves 23.93 TFLOPS &mdash; 95.7% of the 25 TFLOPS theoretical peak.
-  </div>
-</div>
-
-<table>
-  <tr><th>Configuration</th><th>TFLOPS</th><th>Peak %</th>
-      <th><a href="#g-gflops" class="gref">GFLOPS</a>/tile</th>
-      <th>CPU Speedup</th></tr>
-  <tr><td>B=16, separate kernels (baseline)</td>
-      <td>8.98</td><td>35.9%</td><td>374</td>
-      <td>18.5&times;</td></tr>
-  <tr><td>B=32, separate kernels</td>
-      <td>13.47</td><td>53.9%</td><td>561</td>
-      <td>19.5&times;</td></tr>
-  <tr><td>B=48, separate kernels</td>
-      <td>15.98</td><td>63.9%</td><td>666</td>
-      <td>17.6&times;</td></tr>
-  <tr style="background:#d4edda;font-weight:600;">
-      <td>B=48, fused matmul+ReLU kernel</td>
-      <td>23.93</td><td>95.7%</td><td>997</td>
-      <td>25.9&times;</td></tr>
-</table>
+<h3>5.1 Language model quality</h3>
 
 <p>
-All measurements use 24 tiles (3 rows &times; 8 columns), H=128, depth=1000,
-<a href="#g-bf16" class="gref">bfloat16</a>.
-</p>
-
-<h3>5.2 Character language model</h3>
-
-<p>
-The block-recurrent char LM was trained on the tiny Shakespeare dataset (1.1 MB)
-for 10 epochs on a GPU, then run on the NPU:
+The block-recurrent model was trained on the tiny Shakespeare dataset (1.1 MB,
+~1.1M characters) for 10 epochs on a GPU, then deployed to the NPU:
 </p>
 
 <table>
-  <tr><th>Model</th><th>Params</th><th>Val Loss</th><th>Perplexity</th><th>Device</th></tr>
+  <tr><th>Model</th><th>Parameters</th><th>Val Loss</th>
+      <th>Perplexity</th><th>Device</th></tr>
   <tr style="background:#d4edda;font-weight:600;">
       <td>Block-recurrent (8&times;4 pipeline)</td>
       <td>542K</td><td>2.42</td><td>11.2</td><td>NPU (32 tiles)</td></tr>
   <tr><td>Per-layer recurrent (norm every layer)</td>
       <td>542K</td><td>1.94</td><td>6.9</td><td>CPU/GPU only</td></tr>
-  <tr><td>Transformer baseline</td>
+  <tr><td>Transformer baseline (GPT-style)</td>
       <td>818K</td><td>1.89</td><td>6.6</td><td>GPU</td></tr>
 </table>
 
 <p>
-NPU inference performance for the block-recurrent model:
+The per-layer model and the transformer baseline serve as quality references.
+The blocked model produces recognisable Shakespearean English, though with
+occasional incoherence &mdash; expected at perplexity 11.2 with a 542K-parameter
+model trained on 1 MB of text.
 </p>
+
+<h3>5.2 NPU inference performance</h3>
 
 <table>
   <tr><th>Metric</th><th>Value</th></tr>
-  <tr><td>NPU calls per character</td><td>8 (one per 4-layer block)</td></tr>
-  <tr><td>Latency per NPU call</td><td>0.14 ms</td></tr>
+  <tr><td>NPU tiles used</td><td>32 (8 columns &times; 4 rows)</td></tr>
+  <tr><td>NPU calls per character</td><td>8 (one per block)</td></tr>
+  <tr><td>Latency per NPU call</td><td>~0.14 ms</td></tr>
+  <tr><td>Total NPU time per character</td><td>~1.1 ms</td></tr>
+  <tr><td>Total time per character (NPU + CPU)</td><td>~4.2 ms</td></tr>
   <tr><td>Throughput (1 sequence)</td><td>233 chars/s</td></tr>
-  <tr><td>Throughput (384 parallel sequences)</td><td>89,600 chars/s</td></tr>
+  <tr><td>Throughput (384 parallel sequences)</td><td><strong>89,600 chars/s</strong></td></tr>
 </table>
 
 <p>
-The quality gap between the blocked and per-layer models (2.42 vs 1.94) reflects
-the cost of grouping layers: inter-layer normalization and input injection help
-gradient flow and information access, but they require CPU intervention that breaks
-the NPU pipeline. This is the fundamental hardware&ndash;quality trade-off.
+The 384-sequence throughput is the key figure: by processing 8&nbsp;columns
+&times; 48&nbsp;samples per column in parallel, we amortise the per-call
+overhead across hundreds of sequences. The CPU overhead between NPU calls
+(RMSNorm, embedding lookup, residual addition) accounts for the gap between
+the 1.1 ms of NPU time and the 4.2 ms total latency per character.
 </p>
 
-<h3>5.3 Optimisation analysis (throughput benchmark)</h3>
+<h3>5.3 What limits throughput</h3>
 
 <p>
-Two independent levers drove the improvement from 8.98 to 23.93 TFLOPS:
-</p>
-
-<h4>Increasing batch size (B=16 &rarr; B=48)</h4>
-<p>
-The <a href="#g-mmul" class="gref">MMUL</a> unit processes 8&times;8 blocks using
-a 2&times;2 expansion pattern. With B=16, the outer loop runs M/(2r) = 16/16 = 1
-iteration &mdash; too few for the chess compiler to
-<a href="#v-pipeline" class="gref">pipeline</a> effectively. At B=48, there are
-3 iterations, giving the compiler enough &ldquo;runway&rdquo; to overlap loads,
-multiplications, and stores. This alone improved throughput from 8.98 to
-15.98 TFLOPS (+78%).
-</p>
-
-<h4>Fused matmul+<a href="#g-relu" class="gref">ReLU</a> kernel</h4>
-<p>
-The original approach used three separate kernel calls per matmul: (1) zero the
-output buffer, (2) accumulate C&nbsp;+=&nbsp;A&times;B, (3) apply ReLU in-place.
-Each call had dispatch overhead and the zero pass wasted cycles moving data
-through <a href="#g-sram" class="gref">SRAM</a>.
+Each NPU call performs only 4 matmuls of size 48&times;128&times;128 &mdash;
+a tiny amount of arithmetic completed in microseconds. The ~0.14 ms measured
+per call is dominated by <a href="#g-xrt" class="gref">XRT</a> driver
+overhead (instruction dispatch, <a href="#g-dma" class="gref">DMA</a> setup),
+not compute. With 8 calls per character, that overhead adds up.
 </p>
 
 <p>
-Our fused <code>matmul_relu</code> kernel eliminates all three overheads:
-accumulators are zero-initialised in <a href="#v-register" class="gref">registers</a>
-(no SRAM write), the matmul accumulates into them, and ReLU is applied during
-the store phase. At B=48, this boosted throughput from 15.98 to
-<strong>23.93 TFLOPS</strong> (+50%) &mdash; because the compiler can schedule
-the fused zero+MAC+ReLU pipeline when there are enough loop iterations.
+This is fundamentally different from the throughput benchmark (see
+<code>logbook.md</code>), where a single NPU call ran 1000 loop iterations
+on-chip, making compute dominate overhead and achieving 95.7% of the 25
+<a href="#g-tflops" class="gref">TFLOPS</a> peak. The character LM trades
+peak utilisation for a richer, more useful architecture.
 </p>
 
 <div class="key-insight">
-<strong>Key insight:</strong> Kernel fusion and batch size interact
-<em>non-linearly</em>. The fused kernel was 10% <em>slower</em> at B=16
-(8.03 vs 8.98 TFLOPS) but 50% <em>faster</em> at B=48 (23.93 vs 15.98).
-The compiler needs enough outer-loop iterations to schedule the additional
-fused operations into the pipeline.
+<strong>Insight:</strong> NPU utilisation is not the goal &mdash; building a
+useful model that runs on the NPU is. The architecture is designed for
+correctness of the hardware mapping; throughput optimisation (larger hidden
+dimensions, fewer blocks, quantisation) is future work.
 </div>
-
-<h3>5.4 Remaining gap to peak</h3>
-
-<p>
-At 95.7% of the 25 TFLOPS theoretical peak, the remaining 4.3% (~1.1 TFLOPS)
-is accounted for by:
-</p>
-
-<ul>
-  <li><strong><a href="#g-bfp16" class="gref">BFP16</a> emulation overhead:</strong>
-      The MMUL unit uses block-floating-point emulation for bf16 with r=s=t=8
-      tile factors. This requires reformatting exponents, costing a few
-      cycles per block.</li>
-  <li><strong>Array utilization:</strong> We use 24 of 32 tiles (75%) due
-      to MemTile routing constraints. The 8 unused tiles represent
-      potential headroom if routing can be improved.</li>
-  <li><strong>Invocation overhead:</strong> ~120 &mu;s of fixed driver/DMA
-      setup per NPU call, amortised over ~1.3 ms of compute but still
-      contributing ~8% overhead at depth=1000.</li>
-</ul>
 
 <h2>6. The Toolchain</h2>
 
