@@ -1,9 +1,9 @@
 # Development Logbook
 
 This file records the project's development history — earlier architectures,
-benchmark results, and technical discoveries made along the way. The main
-README and whitepaper describe the current system (the block-recurrent
-character LM). Everything here is also preserved in the git history.
+benchmark results, and technical discoveries made along the way. The current
+system (resmlp) is described in the README and whitepaper. Earlier experimental
+code (char_lm, spatial_mlp) lives on the `experimental` branch.
 
 ---
 
