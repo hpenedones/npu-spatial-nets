@@ -83,10 +83,66 @@ rms_norm_inplace(bfloat16 *__restrict input,
     }
 }
 
+// ── Matmul + ReLU (1×1 tile expansion) ─────────────────────────────────
+//
+// Processes one output tile block at a time.  Works for any DIM_M
+// divisible by r (=8).  The outer loop over column blocks (colB)
+// provides pipelining opportunities when colB ≥ 3 (H ≥ 24).
+//
+// Used when DIM_M < 2*r (e.g. B=8) — the 2×2 variant would read
+// out-of-bounds on the second row block.
+
+template <typename T_in, typename T_out,
+          unsigned rowA, unsigned colA, unsigned colB,
+          unsigned r, unsigned s, unsigned t>
+static inline void
+matmul_relu_1x1(const T_in *__restrict pA,
+                const T_in *__restrict pB,
+                T_out *__restrict pC)
+{
+    using MMUL = aie::mmul<r, s, t, T_in, T_in, accauto>;
+    const aie::vector<T_out, MMUL::size_C> zeros =
+        aie::zeros<T_out, MMUL::size_C>();
+
+    event0();
+
+    for (unsigned z = 0; z < rowA; z += 1) {
+        T_out *__restrict pC1 = pC + (z * colB) * MMUL::size_C;
+
+        for (unsigned j = 0; j < colB; j += 1)
+            chess_prepare_for_pipelining chess_loop_range(3, )
+        {
+            const T_in *__restrict pA1 = pA + (z * colA) * MMUL::size_A;
+            const T_in *__restrict pB1 = pB + j * MMUL::size_B;
+
+            MMUL C00(zeros);
+
+            for (unsigned i = 0; i < colA; ++i)
+                chess_flatten_loop
+            {
+                aie::vector<T_in, MMUL::size_A> A0 =
+                    aie::load_v<MMUL::size_A>(pA1);
+                pA1 += MMUL::size_A;
+                aie::vector<T_in, MMUL::size_B> B0 =
+                    aie::load_v<MMUL::size_B>(pB1);
+                pB1 += MMUL::size_B * colB;
+
+                C00.mac(A0, B0);
+            }
+
+            aie::store_v(pC1,
+                aie::max(C00.template to_vector<T_out>(), zeros));
+            pC1 += MMUL::size_C;
+        }
+    }
+
+    event1();
+}
+
 // ── Matmul + ReLU (2×2 tile expansion) ─────────────────────────────────
 //
-// Identical to matmul_relu.cc — processes 2×2 output tile blocks per
-// inner-loop iteration for high register utilisation.
+// Processes 2×2 output tile blocks per inner-loop iteration for high
+// register utilisation.  Requires DIM_M >= 2*r (i.e. B >= 16).
 
 template <typename T_in, typename T_out,
           unsigned rowA, unsigned colA, unsigned colB,
@@ -177,13 +233,23 @@ void norm_matmul_relu_bf16_bf16(bfloat16 *a, bfloat16 *w_and_scale,
 
     // Step 2: fused matmul + ReLU on the normalised input
     constexpr int r = 8, s = 8, t = 8;
-    static_assert(DIM_M % (2 * r) == 0);
+    static_assert(DIM_M % r == 0);
     static_assert(DIM_K % s == 0);
-    static_assert(DIM_N % (2 * t) == 0);
     ::aie::set_rounding(aie::rounding_mode::floor);
+
+#if (DIM_M / 8) >= 2
+    // 2×2 expansion — better register utilization (B >= 16)
+    static_assert(DIM_N % (2 * t) == 0);
     matmul_relu_2x2<bfloat16, bfloat16,
                      (DIM_M / r), (DIM_K / s), (DIM_N / t),
                      r, s, t>(a, w_and_scale, c);
+#else
+    // 1×1 expansion — works for any B divisible by 8
+    static_assert(DIM_N % t == 0);
+    matmul_relu_1x1<bfloat16, bfloat16,
+                     (DIM_M / r), (DIM_K / s), (DIM_N / t),
+                     r, s, t>(a, w_and_scale, c);
+#endif
 }
 #else
 void norm_matmul_relu_bf16_bf16(bfloat16 *a, bfloat16 *w_and_scale,
@@ -193,13 +259,21 @@ void norm_matmul_relu_bf16_bf16(bfloat16 *a, bfloat16 *w_and_scale,
     rms_norm_inplace(a, scale);
 
     constexpr int r = 4, s = 8, t = 8;
-    static_assert(DIM_M % (2 * r) == 0);
+    static_assert(DIM_M % r == 0);
     static_assert(DIM_K % s == 0);
-    static_assert(DIM_N % (2 * t) == 0);
     ::aie::set_rounding(aie::rounding_mode::floor);
+
+#if (DIM_M / 4) >= 2
+    static_assert(DIM_N % (2 * t) == 0);
     matmul_relu_2x2<bfloat16, bfloat16,
                      (DIM_M / r), (DIM_K / s), (DIM_N / t),
                      r, s, t>(a, w_and_scale, c);
+#else
+    static_assert(DIM_N % t == 0);
+    matmul_relu_1x1<bfloat16, bfloat16,
+                     (DIM_M / r), (DIM_K / s), (DIM_N / t),
+                     r, s, t>(a, w_and_scale, c);
+#endif
 }
 #endif
 
