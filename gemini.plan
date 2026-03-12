@@ -1,0 +1,67 @@
+# NPU Training Implementation Plan
+
+This document outlines the strategy for moving the 32-layer Residual MLP training from the CPU to the AMD XDNA 2 NPU.
+
+## 1. Current State & Constraints
+- **Forward Pass:** The current implementation (`resmlp/design.py`, `resmlp/infer.py`) successfully pipelines inference across 32 NPU tiles using a serpentine path.
+- **Backward Primitive:** A single-tile backward pass primitive exists (`resmlp/backward_single_design.py`, `aie_kernels/residual_backward.cc`) and has been tested (`resmlp/test_backward.py`) but is not yet integrated into a full multi-tile pipeline.
+- **Memory Limits:** Each NPU tile has 64KB of local data memory.
+  - Weight matrix `W` (160x160 bf16): ~51.2 KB
+  - Activations `x` (8x160 bf16): ~2.5 KB
+  - Mask `mask` (8x160 bf16 or bitpacked): ~2.5 KB
+  - Gradients `dW` (160x160 bf16): ~51.2 KB
+  - Gradients `gx`, `gy` (8x160 bf16): ~2.5 KB
+  - *Constraint:* Storing `W`, `dW`, and moments for an optimizer like Adam (2x 51.2 KB) would vastly exceed the 64KB limit. Thus, optimizer steps like Adam must remain on the CPU, or `dW` must be streamed out immediately for the CPU to apply.
+
+## 2. Proposed Architecture for NPU Training
+
+To train on the NPU, we need to orchestrate the forward pass (saving activations/masks), the backward pass (computing gradients), and the weight update.
+
+### Phase 1: Stateful Forward Pipeline (Training Mode)
+Modify the forward kernel and pipeline to persist activations needed for the backward pass.
+- **Action:** Update the NPU forward kernel (`matmul_relu_skip.cc`) to save the input `x` and the ReLU `mask` (`z > 0`) to local tile memory.
+- **Memory Check:** `W` (51.2KB) + `x` (2.5KB) + `mask` (2.5KB) = 56.2KB. This fits comfortably within the 64KB tile memory, meaning we do *not* need to stream activations back to DDR! They can stay resident in the tile for the later backward pass.
+
+### Phase 2: Reverse Snake Pipeline (Backward Pass)
+Create a new 32-tile MLIR design (`resmlp/backward_design.py`) that implements the reverse serpentine path.
+- **Data Flow:** The loss gradient `gY` for the final layer is streamed from DDR into the last NPU tile (Tile 31).
+- **Computation per Tile (using `residual_backward.cc`):**
+  - Reads `x`, `W`, and `mask` from its local memory.
+  - Computes `gz = gy * mask`
+  - Computes `dW = x^T @ gz`
+  - Computes `gx = gy + gz @ W^T`
+- **Gradient Streaming:**
+  - `gx` is streamed to the previous tile in the snake via an `ObjectFifo`.
+  - `dW` is streamed to DDR via a split FIFO (similar to how weights are currently loaded).
+
+### Phase 3: CPU Optimizer & Weight Reloading
+Since advanced optimizers like Adam require tracking momentum and variance (which don't fit in tile memory alongside weights), the weight updates will execute on the host CPU.
+- **Action:** The CPU aggregates all 32 `dW` matrices, and PyTorch applies the Adam optimizer step to update its `W` tensors.
+- **Action:** The CPU then pushes the newly updated `W` matrices into the NPU via the existing forward weight split FIFOs before the next forward pass.
+
+### Phase 4: PyTorch Integration
+Wrap the NPU forward and backward passes in a custom `torch.autograd.Function`.
+- **`forward(ctx, x, weights)`**: Dispatches the batch to the NPU forward pipeline. Leaves `x` and `mask` resident in NPU SRAM. Returns `y`.
+- **`backward(ctx, gY)`**: Dispatches `gY` through the NPU backward pipeline. Reads back `dW` for all 32 layers and `gx` for the input. Returns `gx` and `[dW_0, ... dW_31]`.
+- **Trainer Script:** Modify `train.py` to use this custom autograd function, seamlessly replacing the standard CPU-based `ResidualLinear` layers.
+
+## 3. Implementation Steps
+
+1. **Kernel Updates:**
+   - Modify `matmul_relu_skip.cc` (or create a training variant) to write `x` and `mask` into persistent memory buffers, instead of treating them as purely transient.
+2. **Backward Snake Design:**
+   - Author `backward_design.py` connecting the 32 tiles in reverse order, passing `gx` backward and streaming `dW` to DDR.
+3. **Host Runtime (`resmlp/op.py`):**
+   - Create a new `NPUTrainingOp` that holds contexts for both the forward and backward AIE programs.
+4. **PyTorch Wrapper (`resmlp/model.py`):**
+   - Implement `NpuResmlpFunction(torch.autograd.Function)`.
+5. **Testing & Validation:**
+   - Write `test_training.py` comparing the NPU-computed `y`, `gx`, and `dW` directly against PyTorch's `reference_backward` (similar to `test_backward.py` but for all 32 layers).
+
+## Alternative Options Considered
+- **Micro-batching / Recomputation:** If B was larger (e.g. B=32), activations wouldn't fit in SRAM. We could recompute the forward pass locally during the backward pass using only the input seed, but since B=8 is small enough, persisting in SRAM is optimal.
+- **SGD on NPU (100% On-Chip Training):** 
+  If we switch from Adam to basic SGD, we can update `W` directly in the backward kernel (`W = W - lr * (x^T @ mask * gy)`). 
+  *Deep Memory Analysis:* We do not need to materialize the full 51.2 KB `dW` matrix in memory. We can fuse the update in registers block-by-block, or accumulate the update directly into `W` in SRAM. Furthermore, we don't even need a separate `gz` buffer (2.5 KB) if we compute `gz = gy * mask` in place over the `mask` buffer. 
+  *The resulting footprint:* `W` (51.2KB) + `x` (2.5KB) + `gy` (2.5KB) + `mask/gz` (2.5KB) + `gx` (2.5KB) = **61.2 KB data memory.** This fits safely under the 64 KB AIE2 tile limit!
+  *Implications:* This completely eliminates DDR traffic for weights and gradients during the training loop. `W` is loaded once at the start of the epoch, and the NPU runs 100% asynchronously doing forward and backward passes, streaming only activations (`x` and `gy`) between tiles and host. This enables unbelievable throughput, unbottlenecked by memory bandwidth. We simulate large batch sizes by simply accumulating the updates in `W` continuously over the mini-batches (since SGD is linear). The only downside is losing Adam's faster convergence, but for 32 layers on MNIST, careful learning rate scheduling of pure SGD should be highly effective.
