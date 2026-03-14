@@ -776,7 +776,10 @@ reusing the same hardware context corrupts later invocations. The important
 refinement is that the wrapper no longer needs a full
 \code{DefaultNPURuntime.cleanup()} on every call. Evicting only the cached
 hardware contexts is enough to restore correct execution while keeping the
-instruction-buffer cache hot.
+instruction-buffer cache hot. Long runs still need a small amount of host-side
+garbage collection to release the invalidated contexts. In the current code,
+collecting every 256 full-NPU batches is enough to stay stable well past the
+two-thousand-context mark where a pure no-GC wrapper starts to fail.
 
 In the current stable configuration, host-visible persistence works reliably for
 \code{head\_wt} only. The embed and residual weights are updated in tile memory
@@ -794,10 +797,13 @@ overhead is no longer the dominant bottleneck for this path.
 
 Even with that limitation, the path is no longer a dummy stub. In the current
 repository, the stable full-NPU training mode learns on MNIST instead of
-remaining at chance. A limited probe with 500 training batches and 250
-evaluation batches reaches about 40\% test accuracy, which is enough to show
-that the on-device training path is functionally real even if full weight
-persistence is not yet the final design.
+remaining at chance. After adding the periodic-GC safeguard, a full two-epoch
+MNIST run completes on hardware. In one representative run, epoch 0 takes
+about 77.6 s, epoch 1 about 125.3 s, and the final host-side accuracies are
+about 44.9\% on the training set and 45.6\% on the test set. The remaining gap
+to a cleaner throughput story comes from host-side fresh-context orchestration
+and missing full weight persistence, not from missing forward, backward, or SGD
+math on the array.
 
 \section{Compact glossary}
 

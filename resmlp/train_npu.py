@@ -14,6 +14,7 @@ so `full-npu` mode trains a 30-layer residual stack rather than the original
 """
 
 import argparse
+import gc
 import sys
 import time
 from pathlib import Path
@@ -35,6 +36,7 @@ from resmlp.training_full_op import FullTrainingPipeline
 from resmlp.training_op import TrainingPipeline
 
 NPU_KERNEL_LR = 0.01
+FULL_NPU_CONTEXT_GC_INTERVAL = 256
 
 
 def get_dataloaders(batch_size, data_dir="data", num_workers=2, pin_memory=True):
@@ -255,6 +257,9 @@ def run_full_npu_epoch(model, train_loader,
     model.train()
 
     for batch_idx, (images, labels) in enumerate(train_loader):
+        if batch_idx > 0 and batch_idx % FULL_NPU_CONTEXT_GC_INTERVAL == 0:
+            gc.collect()
+
         x_raw = images.view(B, -1).float().numpy().astype(bfloat16)
         x_tiled = to_tiled(x_raw)
         labels_np = labels.numpy().astype(np.int32, copy=False)
