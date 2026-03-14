@@ -7,8 +7,10 @@ with one layer per tile across 32 NPU tiles, programmed with
 ## resmlp: 32-Layer Residual MLP on MNIST
 
 Each NPU tile holds one weight matrix and computes `y = relu(x @ W) + x`.
-Data flows through all 32 tiles in a serpentine path. The model trains on CPU
-in PyTorch and runs inference on the NPU.
+Data flows through all 32 tiles in a serpentine path. The repo now supports
+both the original hybrid trainer (CPU embed/head + NPU residual stack) and a
+full-NPU training mode that uses the 32 compute tiles as
+`embed + 30 residual + head`.
 
 ```
 Input (784) → Linear → H=160
@@ -31,11 +33,18 @@ Input (784) → Linear → H=160
 # Train on CPU (~45 seconds)
 python -m resmlp.train
 
-# Train on NPU (forward+backward+SGD on 32 tiles)
+# Train with the hybrid path (CPU embed/head, NPU residual stack)
 python -m resmlp.train_npu --epochs 10
 
+# Train with the full-NPU path (1 embed tile + 30 residual tiles + 1 head tile)
+# This mode currently requires all 8 columns / 32 compute tiles.
+# Note: current kernels use a fixed NPU SGD LR of 0.01.
+# Current limitation: weights stay resident on-device, so host checkpoint export
+# and CPU-side evaluation are not implemented for this mode yet.
+python -m resmlp.train_npu --pipeline full-npu --epochs 10
+
 # Run MNIST inference on NPU
-python -m resmlp.infer resmlp/checkpoints/resmlp_epoch009.pt --bench
+python -m resmlp.infer resmlp/checkpoints/resmlp_hybrid_epoch009.pt --bench
 
 # Test NPU pipeline correctness
 python -m tests.test_training --cols 1
@@ -47,14 +56,16 @@ python -m tests.test_inference --cols 1
 ```
 resmlp/
 ├── __init__.py          # Tiled layout utilities (to_tiled / from_tiled)
-├── model.py             # PyTorch model: embed → 32 × ResidualLinear → head
+├── model.py             # PyTorch model: embed → residual stack → head
 ├── train.py             # CPU-only MNIST training
-├── train_npu.py         # NPU-accelerated MNIST training
+├── train_npu.py         # Hybrid and full-NPU MNIST training entry points
 ├── infer.py             # NPU inference with trained weights
 ├── design.py            # IRON snake pipeline (inference: 32 tiles)
 ├── op.py                # IRON operator wrapper (inference)
-├── training_design.py   # IRON training pipeline (fwd + bwd + SGD)
-└── training_op.py       # IRON operator wrapper (training)
+├── training_design.py   # Hybrid training pipeline (32 residual tiles)
+├── training_op.py       # Hybrid training operator wrapper
+├── training_full_design.py # Full-NPU pipeline (embed + 30 residual + head)
+└── training_full_op.py  # Full-NPU operator wrapper
 
 aie_kernels/
 ├── matmul_relu_skip.cc  # Fused fwd kernel: c = relu(a @ w) + a

@@ -660,6 +660,145 @@ one mapping, one working example, fully explained.
 
 \appendix
 
+\section{Current full-NPU training implementation}
+
+The main text explains the cleaner mapping that the current whitepaper is built
+around: CPU embedding, a 32-tile residual snake on the NPU, then a CPU
+classification head. The code in this repository now also contains a more
+ambitious training path in \code{resmlp/train\_npu.py}. That path moves the
+entire MNIST model onto the NPU for one training call: embedding, residual
+stack, classification head, loss, backward pass, and SGD updates.
+
+This appendix documents that implementation as it exists today. The important
+point is not that every systems problem is solved. It is that the training
+computation itself now lives on the array. The remaining rough edges are mostly
+runtime-state and persistence problems, not missing backpropagation math.
+
+\subsection{Tile layout and layer mapping}
+
+The full training graph still uses all 32 compute tiles, but not in the same
+role assignment as the inference snake from the main text. In
+\code{resmlp/training\_full\_design.py}, the 32 tiles are partitioned as shown in
+Table~\ref{tab:full-training-tiles}.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabularx}{0.92\textwidth}{@{}l l X@{}}
+\toprule
+Tiles & Role & What runs there \\
+\midrule
+tile 0 & embedding & \code{embed\_forward\_bf16} and \code{embed\_backward\_bf16} \\
+tiles 1--30 & hidden stack & one residual layer per tile: \code{matmul\_relu\_skip\_bf16} forward and \code{residual\_backward\_and\_update\_bf16} backward/update \\
+tile 31 & head + loss & \code{head\_forward\_loss\_bf16} and \code{head\_backward\_bf16} \\
+\bottomrule
+\end{tabularx}
+\caption{The current full-NPU training decomposition. The full path uses one
+embed tile, thirty residual tiles, and one head tile.}
+\label{tab:full-training-tiles}
+\end{table}
+
+This means that \code{full-npu} is a 30-residual-layer training design, not the
+older 32-residual-layer inference snake described earlier. The difference is
+structural, not cosmetic: the two end tiles are now used for the irregular
+edges of the network instead of being forced into the residual pattern.
+
+\subsection{What one training call does on the array}
+
+One invocation of the full training program performs the whole forward and
+backward path on device.
+\begin{enumerate}
+  \item The host streams a raw $8\times784$ MNIST batch into the embed tile.
+  \item The embed tile applies the $784\rightarrow32$ projection.
+  \item The activation flows through 30 residual tiles in snake order.
+  \item The head tile computes logits, softmax-cross-entropy quantities, class
+        predictions, and the tiled \code{d\_logits} buffer.
+  \item The backward pass starts at the head tile and propagates gradients back
+        through the residual chain to the embed tile.
+  \item Each stage applies its own SGD update in place.
+\end{enumerate}
+
+The backward kernels are the main novelty. The head kernel in
+\code{aie\_kernels/head\_backward.cc} computes
+\[
+  dY_{\text{hidden}} = d\text{logits}\, W_{\text{head}}^{T}
+\]
+and then applies
+\[
+  W_{\text{head}} \leftarrow W_{\text{head}} - \eta\, Y_{\text{hidden}}^{T} d\text{logits}.
+\]
+The residual kernel in \code{aie\_kernels/residual\_backward.cc} performs both
+gradient propagation through the skip-ReLU layer and the outer-product SGD
+update of the local $32\times32$ weight matrix. The embed kernel in
+\code{aie\_kernels/embed\_backward.cc} does the same for the $784\times32$
+projection matrix.
+
+In other words, the appendix-level claim is strong but precise: SGD is not
+simulated on the host after an NPU forward pass. The weight updates themselves
+are executed inside the AIE kernels.
+
+\subsection{How IRON wires the training graph}
+
+The IRON graph in \code{resmlp/training\_full\_design.py} is the clearest place
+to see how the training step is organized.
+\begin{itemize}
+  \item \code{embed\_wt} and \code{head\_wt} are direct weight FIFOs.
+  \item Residual weights enter as eight per-column FIFOs and are split in the
+        MemTiles into 3 or 4 tile-local weight streams, matching the snake
+        occupancy of each column.
+  \item Activations form one forward chain of \code{ObjectFifo}s.
+  \item Gradients form one backward chain of \code{ObjectFifo}s.
+  \item Each residual tile stores a compact checkpoint buffer containing its
+        input activation and ReLU mask, so the backward phase can reconstruct the
+        local gradient update.
+  \item A small \code{done\_fifo} marks backward completion, and
+        \code{head\_wt\_out} drains the updated head weights back to host-visible
+        memory.
+\end{itemize}
+
+One subtle but important detail is the embed backward phase. The embed tile does
+not keep the full raw $8\times784$ batch as a forward checkpoint in local SRAM.
+Instead, the host re-streams \code{x\_raw} during the backward phase. This is a
+good example of the actual programming style on the array: whenever a buffer is
+too awkward to keep resident, the design should make that data movement
+explicit.
+
+\subsection{What works today, and what does not}
+
+The current implementation is good enough to support the central claim of this
+appendix: the full network, the backward pass, and the SGD update rules can all
+run on the NPU in one training call. It is not yet a fully resident training
+loop across many batches.
+
+The stable path in \code{run\_full\_npu\_batch()} still uses a fresh
+\code{AIEContext} for every batch. That workaround remains necessary because
+reusing the same hardware context corrupts later invocations. The important
+refinement is that the wrapper no longer needs a full
+\code{DefaultNPURuntime.cleanup()} on every call. Evicting only the cached
+hardware contexts is enough to restore correct execution while keeping the
+instruction-buffer cache hot.
+
+In the current stable configuration, host-visible persistence works reliably for
+\code{head\_wt} only. The embed and residual weights are updated in tile memory
+during a call, but the system does not yet drain them back in a form that can be
+reused safely across calls. Earlier attempts either exceeded SRAM, failed
+routing, or exhausted DMA descriptor resources.
+
+This changes the performance picture substantially. The NPU work itself still
+takes about 5 ms for the $B=8$, $H=32$ training design, but the wrapper around
+it is now only a small extra cost instead of a 250 ms teardown penalty. A
+limited 500-batch probe now completes in about 3.7 s while preserving the same
+learning behavior as the older fresh-runtime wrapper. So the present result
+should be read as both a correctness milestone and evidence that the runtime
+overhead is no longer the dominant bottleneck for this path.
+
+Even with that limitation, the path is no longer a dummy stub. In the current
+repository, the stable full-NPU training mode learns on MNIST instead of
+remaining at chance. A limited probe with 500 training batches and 250
+evaluation batches reaches about 40\% test accuracy, which is enough to show
+that the on-device training path is functionally real even if full weight
+persistence is not yet the final design.
+
 \section{Compact glossary}
 
 \begin{table}[h]

@@ -65,6 +65,11 @@ class FullTrainingPipeline(AIEOperatorBase):
             "-DAIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16",
         ]
 
+        copy_head_flags = [
+            f"-DDIM_M={H}",
+            f"-DDIM_K={N_CLS_PADDED}",
+            "-DCOPY_KERNEL_NAME=copy_head_weight_bf16",
+        ]
         kernels_dir = project_dir / "aie_kernels"
 
         xclbin_artifact = XclbinArtifact.new(
@@ -75,18 +80,23 @@ class FullTrainingPipeline(AIEOperatorBase):
                     "full_training_kernels.a",
                     depends=[
                         KernelObjectArtifact.new(
-                            "matmul_relu_skip.o",
+                            "full_matmul_relu_skip.o",
                             extra_flags=res_kernel_flags,
                             depends=[SourceArtifact.new(kernels_dir / "matmul_relu_skip.cc")],
                         ),
                         KernelObjectArtifact.new(
-                            "residual_backward.o",
+                            "full_residual_backward.o",
                             extra_flags=res_kernel_flags,
                             depends=[SourceArtifact.new(kernels_dir / "residual_backward.cc")],
                         ),
                         KernelObjectArtifact.new(
-                            "copy_activation.o",
+                            "full_copy_activation.o",
                             extra_flags=[f"-DDIM_M={B}", f"-DDIM_K={H}"],
+                            depends=[SourceArtifact.new(kernels_dir / "copy_activation.cc")],
+                        ),
+                        KernelObjectArtifact.new(
+                            "copy_head_weight.o",
+                            extra_flags=copy_head_flags,
                             depends=[SourceArtifact.new(kernels_dir / "copy_activation.cc")],
                         ),
                         KernelObjectArtifact.new(
@@ -140,9 +150,7 @@ class FullTrainingPipeline(AIEOperatorBase):
         self.add_buffer("embed_wt", K * H)        # embed weights
         self.add_buffer("res_wt", NUM_RESIDUAL * H * H)  # residual weights
         self.add_buffer("head_wt", H * N_CLS_PADDED)     # head weights
-        self.add_buffer("labels", B, dtype="int32")       # labels
-        self.add_buffer("loss", 1, dtype="float32")       # loss output
-        self.add_buffer("x_raw_bwd", B * K)       # re-streamed input
+        self.add_buffer("labels", 2 * B, dtype="int32")   # labels + preds
 
         self.add_to_runlist(
             "full_training",
@@ -151,6 +159,4 @@ class FullTrainingPipeline(AIEOperatorBase):
             "res_wt",
             "head_wt",
             "labels",
-            "loss",
-            "x_raw_bwd",
         )

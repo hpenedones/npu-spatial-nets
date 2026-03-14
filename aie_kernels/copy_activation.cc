@@ -12,10 +12,13 @@
 #ifndef DIM_K
 #define DIM_K 160
 #endif
+#ifndef COPY_KERNEL_NAME
+#define COPY_KERNEL_NAME copy_activation_bf16
+#endif
 
 extern "C" {
 
-void copy_activation_bf16(bfloat16 *in, bfloat16 *out)
+void COPY_KERNEL_NAME(bfloat16 *in, bfloat16 *out)
 {
     constexpr int total = DIM_M * DIM_K;
     static_assert(total % 32 == 0, "Total elements must be divisible by 32");

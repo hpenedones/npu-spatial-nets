@@ -1,12 +1,13 @@
 """
-PyTorch model for the 32-layer residual MLP.
+PyTorch model for the residual MLP.
 
 Architecture:
     784 (MNIST) → Linear → H
-    [y = relu(x @ W_i) + x]  × 32 layers   (NPU)
+    [y = relu(x @ W_i) + x]  × N layers   (NPU)
     H → Linear → 10 classes
 
-The 32 hidden layers match the 32 NPU tiles exactly.
+    The number of residual layers is configurable so the same class can model
+    both the 32-layer hybrid pipeline and the 30-layer full-NPU pipeline.
 """
 
 import numpy as np
@@ -30,7 +31,7 @@ class ResidualLinear(nn.Module):
 
 
 class ResMLP(nn.Module):
-    """32-layer residual MLP for MNIST classification.
+    """Residual MLP for MNIST classification.
 
     Args:
         hidden_dim: Width of all hidden layers (must match NPU tile dimension).
@@ -55,14 +56,92 @@ class ResMLP(nn.Module):
             x = layer(x)
         return self.head(x)
 
-    def export_npu_weights(self):
-        """Export the 32 hidden-layer weight matrices as numpy bfloat16 arrays.
+    def zero_linear_biases(self):
+        with torch.no_grad():
+            self.embed.bias.zero_()
+            self.head.bias.zero_()
 
-        Returns list of (H, H) numpy arrays in bfloat16, one per layer.
+    def export_residual_weights(self):
+        """Export residual-layer weights as numpy bfloat16 arrays.
+
+        Returns a list of `(H, H)` arrays, one per residual layer.
         """
         from ml_dtypes import bfloat16
+
         weights = []
         for layer in self.layers:
             W = layer.weight.detach().cpu().float().numpy()
             weights.append(W.astype(bfloat16))
         return weights
+
+    def export_npu_weights(self):
+        """Backward-compatible alias for residual-layer export."""
+        return self.export_residual_weights()
+
+    def export_embed_weight(self):
+        """Export embed weights in NPU layout: `[input_dim, hidden_dim]`."""
+        from ml_dtypes import bfloat16
+
+        return self.embed.weight.detach().cpu().float().numpy().T.astype(bfloat16)
+
+    def export_head_weight(self, padded_classes=None):
+        """Export head weights in NPU layout: `[hidden_dim, num_classes]`.
+
+        When `padded_classes` is provided, zero-pad the class dimension to match
+        the NPU head kernel's 8-wide tiling requirement.
+        """
+        from ml_dtypes import bfloat16
+
+        weight = self.head.weight.detach().cpu().float().numpy().T
+        if padded_classes is not None:
+            if padded_classes < weight.shape[1]:
+                raise ValueError(
+                    f"padded_classes={padded_classes} is smaller than "
+                    f"num_classes={weight.shape[1]}"
+                )
+            padded = np.zeros((weight.shape[0], padded_classes), dtype=np.float32)
+            padded[:, : weight.shape[1]] = weight
+            weight = padded
+        return weight.astype(bfloat16)
+
+    def load_residual_weights(self, weights):
+        """Load residual-layer weights from numpy arrays in `[H, H]` layout."""
+        if len(weights) != len(self.layers):
+            raise ValueError(
+                f"Expected {len(self.layers)} residual weights, got {len(weights)}"
+            )
+
+        with torch.no_grad():
+            for layer, weight in zip(self.layers, weights):
+                array = np.asarray(weight, dtype=np.float32)
+                if array.shape != tuple(layer.weight.shape):
+                    raise ValueError(
+                        f"Residual weight has shape {array.shape}, expected "
+                        f"{tuple(layer.weight.shape)}"
+                    )
+                layer.weight.copy_(torch.from_numpy(array))
+
+    def load_embed_weight(self, weight):
+        """Load embed weights from NPU layout `[input_dim, hidden_dim]`."""
+        array = np.asarray(weight, dtype=np.float32)
+        expected = (self.embed.in_features, self.embed.out_features)
+        if array.shape != expected:
+            raise ValueError(
+                f"Embed weight has shape {array.shape}, expected {expected}"
+            )
+
+        with torch.no_grad():
+            self.embed.weight.copy_(torch.from_numpy(array.T))
+
+    def load_head_weight(self, weight):
+        """Load head weights from NPU layout `[hidden_dim, padded_classes]`."""
+        array = np.asarray(weight, dtype=np.float32)
+        if array.shape[0] != self.head.in_features:
+            raise ValueError(
+                f"Head weight has hidden dim {array.shape[0]}, expected "
+                f"{self.head.in_features}"
+            )
+
+        trimmed = array[:, : self.head.out_features]
+        with torch.no_grad():
+            self.head.weight.copy_(torch.from_numpy(trimmed.T))

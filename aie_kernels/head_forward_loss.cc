@@ -27,6 +27,7 @@
 #define NOCPP
 
 #include <aie_api/aie.hpp>
+#include <stdint.h>
 
 #ifndef DIM_M
 #define DIM_M 8
@@ -36,6 +37,9 @@
 #endif
 #ifndef DIM_N_CLS
 #define DIM_N_CLS 16    // padded to multiple of 8
+#endif
+#ifndef LOSS_GRAD_SCALE
+#define LOSS_GRAD_SCALE 1.0f
 #endif
 #ifndef NUM_CLASSES
 #define NUM_CLASSES 10  // actual number of classes
@@ -118,11 +122,61 @@ retile(const float *row_major, bfloat16 *tiled, int B, int N)
     }
 }
 
+static inline float
+fast_exp_approx(float x)
+{
+    if (x < -10.0f) return 0.0f;
+    if (x > 10.0f) x = 10.0f;
+
+    const float inv_ln2 = 1.44269504089f;
+    const float ln2 = 0.69314718056f;
+    float scaled = x * inv_ln2;
+    int exp2_i = (int)scaled;
+    if (scaled < (float)exp2_i) {
+        exp2_i -= 1;
+    }
+    float frac = scaled - (float)exp2_i;
+    float z = frac * ln2;
+    float z2 = z * z;
+    float z3 = z2 * z;
+    float mant = 1.0f + z + 0.5f * z2 + (1.0f / 6.0f) * z3;
+
+    if (exp2_i < -126) return 0.0f;
+    if (exp2_i > 127) exp2_i = 127;
+
+    union {
+        uint32_t bits;
+        float value;
+    } exp2_scale = {(uint32_t)(exp2_i + 127) << 23};
+    return exp2_scale.value * mant;
+}
+
+static inline float
+fast_log_approx(float x)
+{
+    if (x < 1e-7f) x = 1e-7f;
+
+    union {
+        float value;
+        uint32_t bits;
+    } repr = {x};
+
+    int exp2_i = (int)((repr.bits >> 23) & 0xff) - 127;
+    repr.bits = (repr.bits & 0x007fffff) | 0x3f800000;
+
+    float y = repr.value - 1.0f;
+    float y2 = y * y;
+    float y3 = y2 * y;
+    float y4 = y3 * y;
+    float log_mant = y - 0.5f * y2 + (1.0f / 3.0f) * y3 - 0.25f * y4;
+    return (float)exp2_i * 0.69314718056f + log_mant;
+}
+
 extern "C" {
 
 void head_forward_loss_bf16(bfloat16 *y_hidden, bfloat16 *w_head,
                              int32_t *labels, bfloat16 *d_logits,
-                             float *loss_out)
+                             int32_t *preds_out)
 {
     static_assert(DIM_M % 8 == 0);
     static_assert(DIM_H % 8 == 0);
@@ -146,18 +200,23 @@ void head_forward_loss_bf16(bfloat16 *y_hidden, bfloat16 *w_head,
 
     for (int b = 0; b < DIM_M; ++b) {
         float *row = logits_rm + b * DIM_N_CLS;
+        int pred_class = 0;
 
         // Find max for numerical stability (only over actual classes)
         float max_val = row[0];
         for (int c = 1; c < NUM_CLASSES; ++c) {
-            if (row[c] > max_val) max_val = row[c];
+            if (row[c] > max_val) {
+                max_val = row[c];
+                pred_class = c;
+            }
         }
+        preds_out[b] = pred_class;
 
         // Exp and sum
         float exp_vals[DIM_N_CLS];
         float sum_exp = 0.0f;
         for (int c = 0; c < NUM_CLASSES; ++c) {
-            exp_vals[c] = __builtin_expf(row[c] - max_val);
+            exp_vals[c] = fast_exp_approx(row[c] - max_val);
             sum_exp += exp_vals[c];
         }
         // Padded classes get zero probability
@@ -171,23 +230,24 @@ void head_forward_loss_bf16(bfloat16 *y_hidden, bfloat16 *w_head,
             exp_vals[c] *= inv_sum;
         }
 
-        // Cross-entropy loss: -log(prob[label])
         int label = labels[b];
-        float prob_label = exp_vals[label];
-        // Clamp to avoid log(0)
-        if (prob_label < 1e-7f) prob_label = 1e-7f;
-        total_loss += -__builtin_logf(prob_label);
+        bool training_mode = label >= 0 && label < NUM_CLASSES;
+        if (training_mode) {
+            float prob_label = exp_vals[label];
+            total_loss += -fast_log_approx(prob_label);
+        }
 
-        // d_logits = (softmax - one_hot) / B
-        float scale = 1.0f / (float)DIM_M;
+        // Negative labels are used as a prediction-only mode for evaluation.
+        float scale = LOSS_GRAD_SCALE / (float)DIM_M;
         for (int c = 0; c < DIM_N_CLS; ++c) {
-            float one_hot = (c == label) ? 1.0f : 0.0f;
-            d_logits_rm[b * DIM_N_CLS + c] = (exp_vals[c] - one_hot) * scale;
+            if (training_mode) {
+                float one_hot = (c == label) ? 1.0f : 0.0f;
+                d_logits_rm[b * DIM_N_CLS + c] = (exp_vals[c] - one_hot) * scale;
+            } else {
+                d_logits_rm[b * DIM_N_CLS + c] = 0.0f;
+            }
         }
     }
-
-    // Average loss
-    *loss_out = total_loss / (float)DIM_M;
 
     // Step 4: Re-tile d_logits back to bf16 tiled layout
     retile(d_logits_rm, d_logits, DIM_M, DIM_N_CLS);
