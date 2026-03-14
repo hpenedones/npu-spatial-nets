@@ -13,7 +13,10 @@ from iron.common import (
 )
 
 from resmlp.training_full_design import (
-    ROWS_PER_COL, NUM_RESIDUAL, N_CLS_PADDED,
+    EMBED_CHUNK_ROWS,
+    N_CLS_PADDED,
+    NUM_RESIDUAL,
+    ROWS_PER_COL,
 )
 
 
@@ -31,6 +34,7 @@ class FullTrainingPipeline(AIEOperatorBase):
         operator_dir = Path(__file__).parent
         project_dir = operator_dir.parent
         H, B, K = self.H, self.B, self.K_EMBED
+        assert K % EMBED_CHUNK_ROWS == 0
 
         mlir_artifact = PythonGeneratedMLIRArtifact.new(
             f"{prefix}{B}x{H}.mlir",
@@ -40,23 +44,18 @@ class FullTrainingPipeline(AIEOperatorBase):
             requires_context=False,
         )
 
-        # Residual kernels (same as before, but with H=32)
         res_kernel_flags = [
             f"-DDIM_M={B}",
             f"-DDIM_K={H}",
             f"-DDIM_N={H}",
             "-DAIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16",
         ]
-
-        # Embed kernels
         embed_kernel_flags = [
             f"-DDIM_M={B}",
-            f"-DDIM_K_EMBED={K}",
+            f"-DDIM_K_EMBED={EMBED_CHUNK_ROWS}",
             f"-DDIM_H={H}",
             "-DAIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16",
         ]
-
-        # Head kernels
         head_kernel_flags = [
             f"-DDIM_M={B}",
             f"-DDIM_H={H}",
@@ -64,7 +63,11 @@ class FullTrainingPipeline(AIEOperatorBase):
             f"-DNUM_CLASSES=10",
             "-DAIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16",
         ]
-
+        copy_embed_flags = [
+            f"-DDIM_M={EMBED_CHUNK_ROWS}",
+            f"-DDIM_K={H}",
+            "-DCOPY_KERNEL_NAME=copy_embed_weight_bf16",
+        ]
         copy_head_flags = [
             f"-DDIM_M={H}",
             f"-DDIM_K={N_CLS_PADDED}",
@@ -92,6 +95,11 @@ class FullTrainingPipeline(AIEOperatorBase):
                         KernelObjectArtifact.new(
                             "full_copy_activation.o",
                             extra_flags=[f"-DDIM_M={B}", f"-DDIM_K={H}"],
+                            depends=[SourceArtifact.new(kernels_dir / "copy_activation.cc")],
+                        ),
+                        KernelObjectArtifact.new(
+                            "copy_embed_weight.o",
+                            extra_flags=copy_embed_flags,
                             depends=[SourceArtifact.new(kernels_dir / "copy_activation.cc")],
                         ),
                         KernelObjectArtifact.new(
@@ -146,11 +154,12 @@ class FullTrainingPipeline(AIEOperatorBase):
             self.xclbin_artifact.kernel_name,
             self.insts_artifact,
         )
-        self.add_buffer("x_raw", B * K)          # embed input
-        self.add_buffer("embed_wt", K * H)        # embed weights
-        self.add_buffer("res_wt", NUM_RESIDUAL * H * H)  # residual weights
-        self.add_buffer("head_wt", H * N_CLS_PADDED)     # head weights
-        self.add_buffer("labels", 2 * B, dtype="int32")   # labels + preds
+        self.add_buffer("x_raw", B * K)
+        self.add_buffer("embed_wt", K * H)
+        self.add_buffer("res_wt", NUM_RESIDUAL * H * H)
+        self.add_buffer("head_wt", H * N_CLS_PADDED)
+        self.add_buffer("embed_wt_out", K * H)
+        self.add_buffer("labels", 2 * B, dtype="int32")
 
         self.add_to_runlist(
             "full_training",
@@ -158,5 +167,6 @@ class FullTrainingPipeline(AIEOperatorBase):
             "embed_wt",
             "res_wt",
             "head_wt",
+            "embed_wt_out",
             "labels",
         )

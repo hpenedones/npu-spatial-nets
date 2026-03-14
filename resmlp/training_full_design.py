@@ -1,31 +1,33 @@
 """
-IRON design for 100% on-NPU MNIST training pipeline (H=32).
+IRON design for 100% on-NPU MNIST training pipeline.
 
 Tile layout (32 tiles = 1 embed + 30 residual + 1 head):
-    Tile 0  (col 0, row 2):  Embed — 784 → 32 matmul
+    Tile 0  (col 0, row 2):  Embed — 784 → H matmul, streamed over K chunks
     Tiles 1–30 (snake):       Residual — relu(x @ W) + x
-    Tile 31 (col 7, row 5):  Head — 32 → 16 matmul + softmax + CE loss
+    Tile 31 (col 7, row 5):   Head — H → 16 matmul + softmax + CE loss
 
 Forward:
-    Host → x_raw[8×784] → [Embed] → act → [Res 0..29] → [Head] → loss → Host
+    Host → x_raw[8×784] → [Embed] → act → [Res 0..29] → [Head] → preds → Host
     Host → labels[8] → [Head]
 
 Backward:
-    [Head] → gy[8×32] → [Res 29..0] → gy[8×32] → [Embed]
+    [Head] → gy[8×H] → [Res 29..0] → gy[8×H] → [Embed]
     Host → x_raw[8×784] → [Embed]  (re-stream for embed grad)
+    Host ← updated embed/head weights
 """
 
 import numpy as np
 from ml_dtypes import bfloat16
 
 from aie.iron import Kernel, ObjectFifo, Program, Runtime, Worker
-from aie.iron.placers import SequentialPlacer
 from aie.iron.device import NPU2, Tile
+from aie.iron.placers import SequentialPlacer
 from aie.helpers.taplib.tap import TensorAccessPattern
 
 ROWS_PER_COL = 4
 NUM_RESIDUAL = 30
 N_CLS_PADDED = 16
+EMBED_CHUNK_ROWS = 56
 
 
 def snake_tile_order(num_cols):
@@ -39,43 +41,75 @@ def snake_tile_order(num_cols):
 
 def full_training_pipeline(H=32, B=8, K_EMBED=784, num_cols=8):
     assert num_cols == 8 and B % 8 == 0 and H % 8 == 0 and K_EMBED % 8 == 0
+    assert K_EMBED % EMBED_CHUNK_ROWS == 0
     num_tiles = num_cols * ROWS_PER_COL
     assert num_tiles == NUM_RESIDUAL + 2
     tile_order = snake_tile_order(num_cols)
+    num_embed_chunks = K_EMBED // EMBED_CHUNK_ROWS
+
     # ── Types ──────────────────────────────────────────────────────
-    act_ty     = np.ndarray[(B * H,),             np.dtype[bfloat16]]
-    embed_in_ty = np.ndarray[(B * K_EMBED,),      np.dtype[bfloat16]]
-    embed_wt_ty = np.ndarray[(K_EMBED * H,),      np.dtype[bfloat16]]
-    res_wt_ty  = np.ndarray[(H * H,),             np.dtype[bfloat16]]
-    head_wt_ty = np.ndarray[(H * N_CLS_PADDED,),  np.dtype[bfloat16]]
-    ckpt_ty    = np.ndarray[(2 * B * H,),         np.dtype[bfloat16]]
-    labels_ty  = np.ndarray[(B,),                 np.dtype[np.int32]]
+    act_ty = np.ndarray[(B * H,), np.dtype[bfloat16]]
+    embed_in_ty = np.ndarray[(B * K_EMBED,), np.dtype[bfloat16]]
+    embed_in_chunk_ty = np.ndarray[(B * EMBED_CHUNK_ROWS,), np.dtype[bfloat16]]
+    embed_wt_ty = np.ndarray[(K_EMBED * H,), np.dtype[bfloat16]]
+    embed_wt_chunk_ty = np.ndarray[(EMBED_CHUNK_ROWS * H,), np.dtype[bfloat16]]
+    res_wt_ty = np.ndarray[(H * H,), np.dtype[bfloat16]]
+    head_wt_ty = np.ndarray[(H * N_CLS_PADDED,), np.dtype[bfloat16]]
+    ckpt_ty = np.ndarray[(2 * B * H,), np.dtype[bfloat16]]
+    labels_ty = np.ndarray[(B,), np.dtype[np.int32]]
     d_logits_ty = np.ndarray[(B * N_CLS_PADDED,), np.dtype[bfloat16]]
 
     # ── Kernels ────────────────────────────────────────────────────
-    embed_wt_ty_chunk = np.ndarray[((K_EMBED // 4) * H,), np.dtype[bfloat16]]
-    
-    embed_fwd_k  = Kernel("embed_forward_bf16",  "full_training_kernels.a",
-                          [embed_in_ty, embed_wt_ty_chunk, embed_wt_ty_chunk, embed_wt_ty_chunk, embed_wt_ty_chunk, act_ty])
-    embed_bwd_k  = Kernel("embed_backward_bf16", "full_training_kernels.a",
-                          [embed_in_ty, embed_wt_ty_chunk, embed_wt_ty_chunk, embed_wt_ty_chunk, embed_wt_ty_chunk, act_ty])
-    res_fwd_k    = Kernel("matmul_relu_skip_bf16", "full_training_kernels.a",
-                          [act_ty, res_wt_ty, act_ty, ckpt_ty, np.int32])
-    res_copy_k   = Kernel("copy_activation_bf16", "full_training_kernels.a",
-                          [act_ty, act_ty])
-    res_bwd_k    = Kernel("residual_backward_and_update_bf16", "full_training_kernels.a",
-                          [ckpt_ty, res_wt_ty, act_ty, act_ty])
-    head_fwd_k   = Kernel("head_forward_loss_bf16", "full_training_kernels.a",
-                          [act_ty, head_wt_ty, labels_ty, d_logits_ty, labels_ty])
-    head_bwd_k   = Kernel("head_backward_bf16", "full_training_kernels.a",
-                          [act_ty, head_wt_ty, d_logits_ty, act_ty])
-    head_wt_copy_k = Kernel("copy_head_weight_bf16", "full_training_kernels.a",
-                            [head_wt_ty, head_wt_ty])
+    embed_fwd_k = Kernel(
+        "embed_forward_bf16",
+        "full_training_kernels.a",
+        [embed_in_chunk_ty, embed_wt_chunk_ty, act_ty, np.int32],
+    )
+    embed_bwd_k = Kernel(
+        "embed_backward_bf16",
+        "full_training_kernels.a",
+        [embed_in_chunk_ty, embed_wt_chunk_ty, act_ty],
+    )
+    embed_wt_copy_k = Kernel(
+        "copy_embed_weight_bf16",
+        "full_training_kernels.a",
+        [embed_wt_chunk_ty, embed_wt_chunk_ty],
+    )
+    res_fwd_k = Kernel(
+        "matmul_relu_skip_bf16",
+        "full_training_kernels.a",
+        [act_ty, res_wt_ty, act_ty, ckpt_ty, np.int32],
+    )
+    res_copy_k = Kernel(
+        "copy_activation_bf16",
+        "full_training_kernels.a",
+        [act_ty, act_ty],
+    )
+    res_bwd_k = Kernel(
+        "residual_backward_and_update_bf16",
+        "full_training_kernels.a",
+        [ckpt_ty, res_wt_ty, act_ty, act_ty],
+    )
+    head_fwd_k = Kernel(
+        "head_forward_loss_bf16",
+        "full_training_kernels.a",
+        [act_ty, head_wt_ty, labels_ty, d_logits_ty, labels_ty],
+    )
+    head_bwd_k = Kernel(
+        "head_backward_bf16",
+        "full_training_kernels.a",
+        [act_ty, head_wt_ty, d_logits_ty, act_ty],
+    )
+    head_wt_copy_k = Kernel(
+        "copy_head_weight_bf16",
+        "full_training_kernels.a",
+        [head_wt_ty, head_wt_ty],
+    )
 
     # ── Weight ObjectFifos ─────────────────────────────────────────
-    embed_wt_fifo = ObjectFifo(embed_wt_ty_chunk, name="embed_wt", depth=4)
-    
-    head_wt_fifo  = ObjectFifo(head_wt_ty,  name="head_wt",  depth=1)
+    embed_wt_fifo = ObjectFifo(embed_wt_chunk_ty, name="embed_wt", depth=1)
+    embed_wt_out_fifo = ObjectFifo(embed_wt_chunk_ty, name="embed_wt_out", depth=1)
+    head_wt_fifo = ObjectFifo(head_wt_ty, name="head_wt", depth=1)
     head_wt_out = ObjectFifo(head_wt_ty, name="head_wt_out", depth=1)
 
     # Residual weights split per column:
@@ -98,18 +132,16 @@ def full_training_pipeline(H=32, B=8, K_EMBED=784, num_cols=8):
             res_wt_endpoints.append(splits[r])
 
     # ── Activation chain (forward) ─────────────────────────────────
-    embed_in = ObjectFifo(embed_in_ty, name="embed_in", depth=1)
-    act_fifos = [ObjectFifo(act_ty, name=f"act_{i}", depth=1)
-                 for i in range(NUM_RESIDUAL + 1)]
+    embed_in = ObjectFifo(embed_in_chunk_ty, name="embed_in", depth=1)
+    act_fifos = [ObjectFifo(act_ty, name=f"act_{i}", depth=1) for i in range(NUM_RESIDUAL + 1)]
 
     # ── Labels / Loss ──────────────────────────────────────────────
     labels_fifo = ObjectFifo(labels_ty, name="labels", depth=1)
-    preds_fifo  = ObjectFifo(labels_ty, name="preds",  depth=1)
-    done_fifo   = ObjectFifo(np.ndarray[(1,), np.dtype[np.int32]], name="done", depth=1)
+    preds_fifo = ObjectFifo(labels_ty, name="preds", depth=1)
+    done_fifo = ObjectFifo(np.ndarray[(1,), np.dtype[np.int32]], name="done", depth=1)
 
     # ── Gradient chain (backward) ──────────────────────────────────
-    grad_fifos = [ObjectFifo(act_ty, name=f"grad_{i}", depth=1)
-                  for i in range(NUM_RESIDUAL + 1)]
+    grad_fifos = [ObjectFifo(act_ty, name=f"grad_{i}", depth=1) for i in range(NUM_RESIDUAL + 1)]
 
     # ═══════════════════════════════════════════════════════════════
     # WORKERS
@@ -118,62 +150,87 @@ def full_training_pipeline(H=32, B=8, K_EMBED=784, num_cols=8):
 
     # ── Embed tile (tile 0) ────────────────────────────────────────
     embed_col, embed_row = tile_order[0]
+    x_chunk_elems = B * EMBED_CHUNK_ROWS
+    wt_chunk_elems = EMBED_CHUNK_ROWS * H
     embed_wt_ep = embed_wt_fifo.cons()
-    embed_wt_cons = embed_wt_ep.cons() if hasattr(embed_wt_ep, 'cons') else embed_wt_ep
+    embed_wt_cons = embed_wt_ep.cons() if hasattr(embed_wt_ep, "cons") else embed_wt_ep
 
     def make_embed_worker():
-        def w(of_x_in, of_y_out, of_wt, of_grad_in, of_done,
-              fwd_k, bwd_k):
-            x = of_x_in.acquire(1)
+        def w(
+            of_x_fwd,
+            of_y_out,
+            of_w,
+            of_w_out,
+            of_grad_in,
+            of_done,
+            fwd_k,
+            bwd_k,
+            copy_wt_k,
+        ):
             y = of_y_out.acquire(1)
-            
-            # depth=4 means we acquire 4 elements sequentially memory mapped
-            ws = of_wt.acquire(4)
-            fwd_k(x, ws[0], ws[1], ws[2], ws[3], y)
-            of_x_in.release(1)
+            for chunk_idx in range(num_embed_chunks):
+                x = of_x_fwd.acquire(1)
+                wt = of_w.acquire(1)
+                fwd_k(x, wt, y, 1 if chunk_idx == 0 else 0)
+                of_x_fwd.release(1)
+                of_w.release(1)
             of_y_out.release(1)
 
             dy = of_grad_in.acquire(1)
-            x2 = of_x_in.acquire(1)
-            
-            bwd_k(x2, ws[0], ws[1], ws[2], ws[3], dy)
+            for _ in range(num_embed_chunks):
+                x = of_x_fwd.acquire(1)
+                wt = of_w.acquire(1)
+                wt_out = of_w_out.acquire(1)
+                bwd_k(x, wt, dy)
+                copy_wt_k(wt, wt_out)
+                of_x_fwd.release(1)
+                of_w.release(1)
+                of_w_out.release(1)
             done = of_done.acquire(1)
             done[0] = 1
             of_grad_in.release(1)
-            of_x_in.release(1)
             of_done.release(1)
-            of_wt.release(4)
+
         return w
 
-    workers.append(Worker(
-        make_embed_worker(),
-        [embed_in.cons(), act_fifos[0].prod(), embed_wt_cons,
-         grad_fifos[NUM_RESIDUAL].cons(), done_fifo.prod(),
-         embed_fwd_k, embed_bwd_k],
-        placement=Tile(col=embed_col, row=embed_row),
-        stack_size=0x400,
-    ))
+    workers.append(
+        Worker(
+            make_embed_worker(),
+            [
+                embed_in.cons(),
+                act_fifos[0].prod(),
+                embed_wt_cons,
+                embed_wt_out_fifo.prod(),
+                grad_fifos[NUM_RESIDUAL].cons(),
+                done_fifo.prod(),
+                embed_fwd_k,
+                embed_bwd_k,
+                embed_wt_copy_k,
+            ],
+            placement=Tile(col=embed_col, row=embed_row),
+            stack_size=0x400,
+        )
+    )
 
     # ── Residual tiles (tiles 1..30) ───────────────────────────────
     for res_idx in range(NUM_RESIDUAL):
         col, row = tile_order[res_idx + 1]
         local_ckpt = ObjectFifo(ckpt_ty, name=f"ckpt_{res_idx}", depth=1)
 
-        in_ep  = act_fifos[res_idx].cons()
+        in_ep = act_fifos[res_idx].cons()
         out_ep = act_fifos[res_idx + 1].prod()
-        wt_ep  = res_wt_endpoints[res_idx]
-        wt_c   = wt_ep.cons() if hasattr(wt_ep, 'cons') else wt_ep
-        g_in   = grad_fifos[NUM_RESIDUAL - 1 - res_idx].cons()
-        g_out  = grad_fifos[NUM_RESIDUAL - res_idx].prod()
+        wt_ep = res_wt_endpoints[res_idx]
+        wt_c = wt_ep.cons() if hasattr(wt_ep, "cons") else wt_ep
+        g_in = grad_fifos[NUM_RESIDUAL - 1 - res_idx].cons()
+        g_out = grad_fifos[NUM_RESIDUAL - res_idx].prod()
 
         def make_res(ie, oe, we, gi, go):
-            def w(of_in, of_out, of_w, of_gin, of_gout,
-                  of_cp, of_cr, cp_k, fwd_k, bwd_k):
+            def w(of_in, of_out, of_w, of_gin, of_gout, of_cp, of_cr, cp_k, fwd_k, bwd_k):
                 x = of_in.acquire(1)
                 y = of_out.acquire(1)
                 ww = of_w.acquire(1)
                 ck = of_cp.acquire(1)
-                cp_k(x, ck[0:B*H])
+                cp_k(x, ck[0 : B * H])
                 fwd_k(x, ww, y, ck, B * H)
                 of_in.release(1)
                 of_out.release(1)
@@ -187,28 +244,53 @@ def full_training_pipeline(H=32, B=8, K_EMBED=784, num_cols=8):
                 of_gout.release(1)
                 of_cr.release(1)
                 of_w.release(1)
+
             return w
 
-        workers.append(Worker(
-            make_res(in_ep, out_ep, wt_c, g_in, g_out),
-            [in_ep, out_ep, wt_c, g_in, g_out,
-             local_ckpt.prod(), local_ckpt.cons(),
-             res_copy_k, res_fwd_k, res_bwd_k],
-            placement=Tile(col=col, row=row),
-            stack_size=0x1000,
-        ))
+        workers.append(
+            Worker(
+                make_res(in_ep, out_ep, wt_c, g_in, g_out),
+                [
+                    in_ep,
+                    out_ep,
+                    wt_c,
+                    g_in,
+                    g_out,
+                    local_ckpt.prod(),
+                    local_ckpt.cons(),
+                    res_copy_k,
+                    res_fwd_k,
+                    res_bwd_k,
+                ],
+                placement=Tile(col=col, row=row),
+                stack_size=0x400,
+            )
+        )
 
     # ── Head tile (tile 31) ────────────────────────────────────────
     head_col, head_row = tile_order[31]
     head_ckpt_fifo = ObjectFifo(act_ty, name="head_ckpt", depth=1)
-    d_logits_fifo  = ObjectFifo(d_logits_ty, name="d_logits", depth=1)
+    d_logits_fifo = ObjectFifo(d_logits_ty, name="d_logits", depth=1)
     head_wt_ep = head_wt_fifo.cons()
-    head_wt_cons = head_wt_ep.cons() if hasattr(head_wt_ep, 'cons') else head_wt_ep
+    head_wt_cons = head_wt_ep.cons() if hasattr(head_wt_ep, "cons") else head_wt_ep
 
     def make_head():
-        def w(of_yin, of_wt, of_lab,
-              of_wt_out, of_cp, of_cr, of_dlp, of_dlc, of_gout, of_preds,
-              cp_k, fwd_k, bwd_k, copy_wt_k):
+        def w(
+            of_yin,
+            of_wt,
+            of_lab,
+            of_wt_out,
+            of_cp,
+            of_cr,
+            of_dlp,
+            of_dlc,
+            of_gout,
+            of_preds,
+            cp_k,
+            fwd_k,
+            bwd_k,
+            copy_wt_k,
+        ):
             y = of_yin.acquire(1)
             wt = of_wt.acquire(1)
             lb = of_lab.acquire(1)
@@ -235,48 +317,72 @@ def full_training_pipeline(H=32, B=8, K_EMBED=784, num_cols=8):
             of_gout.release(1)
             of_wt_out.release(1)
             of_wt.release(1)
+
         return w
 
-    workers.append(Worker(
-        make_head(),
-        [act_fifos[NUM_RESIDUAL].cons(), head_wt_cons,
-         labels_fifo.cons(),
-         head_wt_out.prod(),
-         head_ckpt_fifo.prod(), head_ckpt_fifo.cons(),
-         d_logits_fifo.prod(), d_logits_fifo.cons(),
-         grad_fifos[0].prod(), preds_fifo.prod(),
-         res_copy_k, head_fwd_k, head_bwd_k, head_wt_copy_k],
-        placement=Tile(col=head_col, row=head_row),
-        stack_size=0x4000,
-    ))
+    workers.append(
+        Worker(
+            make_head(),
+            [
+                act_fifos[NUM_RESIDUAL].cons(),
+                head_wt_cons,
+                labels_fifo.cons(),
+                head_wt_out.prod(),
+                head_ckpt_fifo.prod(),
+                head_ckpt_fifo.cons(),
+                d_logits_fifo.prod(),
+                d_logits_fifo.cons(),
+                grad_fifos[0].prod(),
+                preds_fifo.prod(),
+                res_copy_k,
+                head_fwd_k,
+                head_bwd_k,
+                head_wt_copy_k,
+            ],
+            placement=Tile(col=head_col, row=head_row),
+            stack_size=0x4000,
+        )
+    )
 
     # ═══════════════════════════════════════════════════════════════
     # RUNTIME SEQUENCE
     # ═══════════════════════════════════════════════════════════════
-    host_embed_in_ty = np.ndarray[(B * K_EMBED,),          np.dtype[bfloat16]]
-    host_embed_wt_ty = np.ndarray[(K_EMBED * H,),          np.dtype[bfloat16]]
-    host_res_wt_ty   = np.ndarray[(NUM_RESIDUAL * H * H,), np.dtype[bfloat16]]
-    host_head_wt_ty  = np.ndarray[(H * N_CLS_PADDED,),     np.dtype[bfloat16]]
-    host_labels_ty   = np.ndarray[(2 * B,),                np.dtype[np.int32]]
-    host_done_ty     = np.ndarray[(1,),                    np.dtype[np.int32]]
+    host_embed_in_ty = np.ndarray[(B * K_EMBED,), np.dtype[bfloat16]]
+    host_embed_wt_ty = np.ndarray[(K_EMBED * H,), np.dtype[bfloat16]]
+    host_res_wt_ty = np.ndarray[(NUM_RESIDUAL * H * H,), np.dtype[bfloat16]]
+    host_head_wt_ty = np.ndarray[(H * N_CLS_PADDED,), np.dtype[bfloat16]]
+    host_embed_wt_out_ty = np.ndarray[(K_EMBED * H,), np.dtype[bfloat16]]
+    host_labels_ty = np.ndarray[(2 * B,), np.dtype[np.int32]]
+    host_done_ty = np.ndarray[(1,), np.dtype[np.int32]]
 
     rt = Runtime()
     with rt.sequence(
-        host_embed_in_ty, host_embed_wt_ty, host_res_wt_ty,
-        host_head_wt_ty, host_labels_ty, host_done_ty,
-    ) as (x_raw, wt_embed, wt_res, wt_head, labels, done_out):
+        host_embed_in_ty,
+        host_embed_wt_ty,
+        host_res_wt_ty,
+        host_head_wt_ty,
+        host_embed_wt_out_ty,
+        host_labels_ty,
+        host_done_ty,
+    ) as (x_raw, wt_embed, wt_res, wt_head, wt_embed_out, labels, done_out):
         rt.start(*workers)
 
         tg_fwd = rt.task_group()
-        wt_embed_tap0 = TensorAccessPattern((1, K_EMBED * H), 0, [1, (K_EMBED // 4), H], [0, H, 1])
-        wt_embed_tap1 = TensorAccessPattern((1, K_EMBED * H), (K_EMBED // 4) * H, [1, (K_EMBED // 4), H], [0, H, 1])
-        wt_embed_tap2 = TensorAccessPattern((1, K_EMBED * H), 2 * (K_EMBED // 4) * H, [1, (K_EMBED // 4), H], [0, H, 1])
-        wt_embed_tap3 = TensorAccessPattern((1, K_EMBED * H), 3 * (K_EMBED // 4) * H, [1, (K_EMBED // 4), H], [0, H, 1])
-        rt.fill(embed_wt_fifo.prod(), wt_embed, tap=wt_embed_tap0, task_group=tg_fwd)
-        rt.fill(embed_wt_fifo.prod(), wt_embed, tap=wt_embed_tap1, task_group=tg_fwd)
-        rt.fill(embed_wt_fifo.prod(), wt_embed, tap=wt_embed_tap2, task_group=tg_fwd)
-        rt.fill(embed_wt_fifo.prod(), wt_embed, tap=wt_embed_tap3, task_group=tg_fwd)
-        rt.fill(head_wt_fifo.prod(),  wt_head,  task_group=tg_fwd)
+        embed_in_tap = TensorAccessPattern(
+            (1, B * K_EMBED),
+            0,
+            [num_embed_chunks, x_chunk_elems],
+            [x_chunk_elems, 1],
+        )
+        embed_wt_tap = TensorAccessPattern(
+            (1, K_EMBED * H),
+            0,
+            [num_embed_chunks, EMBED_CHUNK_ROWS, H],
+            [wt_chunk_elems, H, 1],
+        )
+        rt.fill(embed_in.prod(), x_raw, tap=embed_in_tap, task_group=tg_fwd)
+        rt.fill(embed_wt_fifo.prod(), wt_embed, tap=embed_wt_tap, task_group=tg_fwd)
+        rt.fill(head_wt_fifo.prod(), wt_head, task_group=tg_fwd)
 
         res_wt_offset = 0
         for n_res, wt_ddr in zip(res_per_col, res_wt_ddrs):
@@ -284,21 +390,22 @@ def full_training_pipeline(H=32, B=8, K_EMBED=784, num_cols=8):
             tap = TensorAccessPattern(
                 (1, NUM_RESIDUAL * H * H),
                 res_wt_offset,
-                [1, n_res, H, H],
-                [0, H * H, H, 1],
+                [1, col_elems],
+                [0, 1],
             )
             rt.fill(wt_ddr.prod(), wt_res, tap, task_group=tg_fwd)
             res_wt_offset += col_elems
 
         labels_in_tap = TensorAccessPattern((1, 2 * B), 0, [1, B], [0, 1])
         preds_out_tap = TensorAccessPattern((1, 2 * B), B, [1, B], [0, 1])
-        rt.fill(embed_in.prod(),    x_raw,  task_group=tg_fwd)
         rt.fill(labels_fifo.prod(), labels, tap=labels_in_tap, task_group=tg_fwd)
         rt.drain(preds_fifo.cons(), labels, tap=preds_out_tap, wait=True, task_group=tg_fwd)
         rt.finish_task_group(tg_fwd)
 
         tg_bwd = rt.task_group()
-        rt.fill(embed_in.prod(), x_raw, task_group=tg_bwd)
+        rt.fill(embed_in.prod(), x_raw, tap=embed_in_tap, task_group=tg_bwd)
+        rt.fill(embed_wt_fifo.prod(), wt_embed, tap=embed_wt_tap, task_group=tg_bwd)
+        rt.drain(embed_wt_out_fifo.cons(), wt_embed_out, tap=embed_wt_tap, task_group=tg_bwd)
         rt.drain(done_fifo.cons(), done_out, wait=True, task_group=tg_bwd)
         rt.drain(head_wt_out.cons(), wt_head, wait=True, task_group=tg_bwd)
         rt.finish_task_group(tg_bwd)

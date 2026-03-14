@@ -97,47 +97,52 @@ def evict_full_npu_contexts():
         cleanup_entry(entry)
 
 
-def run_full_npu_batch(npu_op, model, embed_packed, residual_packed, head_packed,
+def run_full_npu_batch(model, embed_packed, residual_packed, head_packed,
                        x_tiled, labels_buf, H, B, num_cols):
-    K_EMBED = model.embed.in_features
-    # We now have two separate embedding weight buffers. Let's slice `embed_packed` array into halves.
-    embed_0 = embed_packed[: (K_EMBED // 2) * H]
-    embed_1 = embed_packed[(K_EMBED // 2) * H :]
-    
-    npu_op.write_buffer("embed_in", x_tiled)
-    npu_op.write_buffer("embed_wt_0", embed_0)
-    npu_op.write_buffer("embed_wt_1", embed_1)
-    
-    for c in range(num_cols):
-        # We need to map res_wt_col{c} buffers, but since we didn't chunk the residual weights 
-        # inside `run_full_npu_batch`, let's just write them using the `res_wt_colX` mapped names.
-        pass
-        
-    # Wait, in the earlier diff, did I check how `train_npu.py` writes residual weights?
-    # It writes to `res_wt`, which means it uses a single contiguous buffer! But `training_full_design.py` splits them!
-    # Ah, `train_npu.py` accesses `npu_op.write_buffer(name, buf)`. 
-    # Let's check `training_full_op.py` or how `Runtime()` works. 
-    # Actually, `Runtime()` mapped them as `x_raw`, `wt_embed`, `wt_res`, `wt_head`, `labels`, `done_out`.
-    # `train_npu.py` uses EXACT string names matching the arg names to `Sequence()`!
-    npu_op.write_buffer("x_raw", x_tiled)
-    npu_op.write_buffer("wt_embed", embed_packed)
-    npu_op.write_buffer("wt_res", residual_packed)
-    npu_op.write_buffer("wt_head", head_packed)
-    npu_op.write_buffer("labels", labels_buf)
+    evict_full_npu_contexts()
+    ctx = None
+    npu_op = None
+    try:
+        ctx = AIEContext(use_runlist=False)
+        npu_op = FullTrainingPipeline(
+            H=H,
+            B=B,
+            K_EMBED=model.embed.in_features,
+            num_cols=num_cols,
+            context=ctx,
+        )
+        ctx.compile_all()
+        ctx.prepare_runtime()
 
-    t_npu = time.perf_counter()
-    npu_op.run_runlist()
-    elapsed = time.perf_counter() - t_npu
+        npu_op.write_buffer("x_raw", x_tiled)
+        npu_op.write_buffer("embed_wt", embed_packed)
+        npu_op.write_buffer("res_wt", residual_packed)
+        npu_op.write_buffer("head_wt", head_packed)
+        npu_op.write_buffer("labels", labels_buf)
 
-    preds_np = npu_op.read_buffer("labels", (2 * B,), copy=True, dtype=np.int32)[B:]
-    embed_out = npu_op.read_buffer("wt_embed", (K_EMBED * H,), copy=True)
-    residual_out = npu_op.read_buffer("wt_res", (NUM_RESIDUAL * H * H,), copy=True)
-    head_out = npu_op.read_buffer("wt_head", (H * N_CLS_PADDED,), copy=True)
+        t_npu = time.perf_counter()
+        npu_op.run_runlist()
+        elapsed = time.perf_counter() - t_npu
+
+        preds_np = npu_op.read_buffer("labels", (2 * B,), copy=True, dtype=np.int32)[B:]
+        embed_out = npu_op.read_buffer(
+            "embed_wt_out", (model.embed.in_features * H,), copy=True
+        )
+        residual_out = npu_op.read_buffer(
+            "res_wt", (NUM_RESIDUAL * H * H,), copy=True
+        )
+        head_out = npu_op.read_buffer(
+            "head_wt", (H * N_CLS_PADDED,), copy=True
+        )
+    finally:
+        npu_op = None
+        ctx = None
+        evict_full_npu_contexts()
 
     for name, buf in (
-        ("wt_embed", embed_out),
-        ("wt_res", residual_out),
-        ("wt_head", head_out),
+        ("embed_wt_out", embed_out),
+        ("res_wt", residual_out),
+        ("head_wt", head_out),
     ):
         if not np.isfinite(np.asarray(buf, dtype=np.float32)).all():
             raise RuntimeError(f"{name} became non-finite after full-NPU batch")
@@ -247,7 +252,7 @@ def run_hybrid_epoch(model, optimizer, criterion, train_loader, npu_op,
 
 def run_full_npu_epoch(model, train_loader,
                        embed_packed, residual_packed, head_packed, H, B,
-                       num_cols, npu_op, max_batches=None):
+                       num_cols, max_batches=None):
     total = 0
     correct = 0
     npu_time = 0.0
@@ -255,9 +260,10 @@ def run_full_npu_epoch(model, train_loader,
 
     model.train()
 
-    desc = "Epoch [full-npu] (train)"
-    bar = tqdm.tqdm(train_loader, desc=desc, ncols=100)
-    for batch_idx, (images, labels) in enumerate(bar):
+    for batch_idx, (images, labels) in enumerate(train_loader):
+        if batch_idx > 0 and batch_idx % FULL_NPU_CONTEXT_GC_INTERVAL == 0:
+            gc.collect()
+
         x_raw = images.view(B, -1).float().numpy().astype(bfloat16)
         x_tiled = to_tiled(x_raw)
         labels_np = labels.numpy().astype(np.int32, copy=False)
@@ -267,7 +273,6 @@ def run_full_npu_epoch(model, train_loader,
 
         try:
             batch_stats = run_full_npu_batch(
-                npu_op,
                 model,
                 embed_packed,
                 residual_packed,
@@ -290,11 +295,8 @@ def run_full_npu_epoch(model, train_loader,
         total += B
         preds_np = batch_stats["preds"]
         correct += int((preds_np[:B] == labels_np).sum())
-
         if max_batches is not None and batch_idx + 1 >= max_batches:
             break
-        
-        bar.set_postfix({"npu_ms": f"{batch_stats['npu_time']*1000:.1f}"})
 
     return {
         "train_loss": None,
@@ -395,6 +397,9 @@ def main():
                                       num_cols=num_cols, context=ctx)
     ctx.compile_all()
     ctx.prepare_runtime()
+    if args.pipeline == "full-npu":
+        evict_full_npu_contexts()
+        npu_op = None
     print(f"  Compiled in {time.time() - t0:.1f}s")
 
     residual_weights = model.export_residual_weights()
@@ -437,7 +442,6 @@ def main():
                 model, train_loader,
                 embed_packed, residual_packed, head_packed, H, B,
                 num_cols=num_cols,
-                npu_op=npu_op,
                 max_batches=args.max_train_batches,
             )
             embed_packed = stats["embed_packed"]
