@@ -20,7 +20,7 @@ from resmlp.streaming_op import StreamingResMLP
 class ResidualStreamingInferenceService:
     """Host-facing infinite stream API over repeated multi-microbatch NPU chunks."""
 
-    def __init__(self, checkpoint, *, hidden_dim=None, num_layers=None, num_cols=8, stream_depth=6):
+    def __init__(self, checkpoint, *, hidden_dim=None, num_layers=None, num_cols=8, stream_depth=32):
         self.B = 8
         self.num_cols = num_cols
         self.num_tiles = num_cols * ROWS_PER_COL
@@ -150,8 +150,8 @@ def main():
     parser.add_argument(
         "--stream-depth",
         type=int,
-        default=6,
-        help="Microbatches per NPU call; validated up to 6 on the full H=160, 32-tile path",
+        default=32,
+        help="Microbatches per NPU call; validated up to 32 on the full H=160, 32-tile path",
     )
     parser.add_argument("--bench", action="store_true", help="Show timing")
     parser.add_argument("--max-batches", type=int, default=None)

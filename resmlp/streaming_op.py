@@ -24,7 +24,7 @@ from resmlp.design import ROWS_PER_COL
 class StreamingResMLP(AIEOperatorBase):
     """Forward-only residual snake with compile-time embedded inference weights."""
 
-    def __init__(self, packed_weights_by_tile, H=160, B=8, num_cols=8, stream_depth=6, context=None):
+    def __init__(self, packed_weights_by_tile, H=160, B=8, num_cols=8, stream_depth=32, context=None):
         self.H = H
         self.B = B
         self.num_cols = num_cols

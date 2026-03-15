@@ -254,7 +254,7 @@ Constraint & Why it matters & Choice in this project \\
 8$\times$8 MMUL-friendly layout & Host tensors must be packed in blocked layout; dimensions should be multiples of 8 & Choose $B=8$ and $H=160$; use \code{to\_tiled()} / \code{from\_tiled()} \\
 Explicit routing & Every inter-tile handoff has to be representable as a FIFO / route & Use a single snake of plain \code{ObjectFifo}s across all 32 tiles \\
 Invocation overhead & Small calls waste hardware; fixed overhead dominates when the batch is tiny & Accept this for clarity; frame \code{B=8} as pedagogical, not peak-throughput \\
-Current runtime semantics & Finite XRT calls still shape the schedule, but inference no longer needs per-call weight DMA & Use checkpoint-specific inference XCLBINs with embedded tile-local weights; validated deep streaming up to \code{stream\_depth=6} on the full $H=160$ path \\
+Current runtime semantics & Finite XRT calls still shape the schedule, but inference no longer needs per-call weight DMA & Use checkpoint-specific inference XCLBINs with embedded tile-local weights and repeated shim DMA boundary tasks; validated deep streaming up to \code{stream\_depth=32} on the full $H=160$ path \\
 \bottomrule
 \end{tabularx}
 \caption{This is the minimal constraint set needed to understand the rest of the document. Anything else belongs in an appendix, the code, or the logbook.}
@@ -994,12 +994,29 @@ microbatches. In the current implementation, \code{stream\_depth} means exactly
 that: how many $B=8$ activation microbatches are fed through the snake before
 control returns to the host.
 
-Importantly, this is still not a fully free-running conveyor belt. The runtime
-issues a finite sequence of fills and drains, and the workers consume a finite
-number of activation tokens per call. But inside that finite chunk, the array
-does behave like a layered pipeline: while later tiles are working on older
-microbatches, earlier tiles can already start the next ones. The measured
-throughput scaling confirms that this overlap is real.
+The first implementation of this idea still hit an avoidable runtime ceiling.
+Even though the array-side workers were happy to loop over many microbatches,
+the host runtime issued one fill task and one drain task per microbatch. That
+kept the boundary FIFOs small, but it meant that deeper chunks stressed the
+shim-task schedule before they stressed the arithmetic.
+
+The fix was to keep the tile-local FIFOs exactly as small as before
+(\code{depth=2} for \code{stream\_depth > 1}) and instead change the boundary
+runtime contract. The current design uses a single repeated shim DMA fill and a
+single repeated shim DMA drain per call, driven by a custom
+\code{TensorAccessPattern} whose leading size is \code{stream\_depth}. In
+practice, that means one runtime task can replay the same $B\times H$
+microbatch transfer many times, so the first and last compute tiles never have
+to allocate a giant activation window in SRAM just to reach a deeper steady
+state.
+
+This is still not a fully free-running conveyor belt. Control still returns to
+the host after a finite chunk, and a true indefinitely running service would
+need a more persistent runtime abstraction. But inside that chunk, the array now
+does behave like the desired layered pipeline: while later tiles are working on
+older microbatches, earlier tiles can already start the next ones. The measured
+throughput scaling confirms that this overlap is real all the way to
+\code{stream\_depth=32}.
 
 \begin{table}[h]
 \centering
@@ -1009,10 +1026,12 @@ throughput scaling confirms that this overlap is real.
 Mode & Images / call & Img/s & ms/call & Speedup vs one-shot \\
 \midrule
 One-shot residual inference & 8 & 35{,}026 & 0.228 & 1.0$\times$ \\
-Embedded streaming, depth 1 & 8 & 68{,}412 & 0.117 & 2.0$\times$ \\
-Embedded streaming, depth 2 & 16 & 135{,}276 & 0.118 & 3.9$\times$ \\
-Embedded streaming, depth 4 & 32 & 259{,}224 & 0.123 & 7.4$\times$ \\
-Embedded streaming, depth 6 & 48 & 372{,}201 & 0.129 & 10.6$\times$ \\
+Repeated-BD streaming, depth 1 & 8 & 70{,}771 & 0.113 & 2.0$\times$ \\
+Repeated-BD streaming, depth 2 & 16 & 137{,}510 & 0.116 & 3.9$\times$ \\
+Repeated-BD streaming, depth 4 & 32 & 260{,}881 & 0.123 & 7.4$\times$ \\
+Repeated-BD streaming, depth 8 & 64 & 478{,}327 & 0.134 & 13.7$\times$ \\
+Repeated-BD streaming, depth 16 & 128 & 898{,}220 & 0.143 & 25.6$\times$ \\
+Repeated-BD streaming, depth 32 & 256 & 1{,}458{,}411 & 0.176 & 41.6$\times$ \\
 \bottomrule
 \end{tabular}
 \caption{Full $H=160$, $B=8$, 8-column / 32-tile residual body on hardware.
@@ -1023,29 +1042,30 @@ only the host/runtime contract changes.}
 
 These numbers matter for two reasons. First, they show that resident weights
 alone are already worthwhile: depth 1 is about twice as fast as the old
-one-shot path. Second, the near-linear gain from depth 1 to depth 6 shows that
-multiple microbatches really are overlapping in the array rather than merely
-waiting in host memory. In a longer sustained run, the depth-6 configuration
-processed 10{,}000{,}032 images in about 26.35 s, which is about
-379k images/s wall-clock throughput and about 407k images/s if only the
-kernel wait time is counted.
+one-shot path. Second, the near-linear gain from depth 1 all the way to depth
+32 shows that multiple microbatches really are overlapping in the array rather
+than merely waiting in host memory. The current full-path sweep reaches about
+1.46 million images/s wall-clock throughput at depth 32, which corresponds to
+about 2.39 TFLOPS for the residual body. In a longer one-million-image
+benchmark, the same depth-32 configuration sustains about 1.51 million
+images/s wall-clock and about 1.59 million images/s if only kernel wait time is
+counted, or roughly 2.47 / 2.60 TFLOPS.
 
-\subsection{Why the current ceiling is depth 6, not depth 32}
+\subsection{What depth 32 means --- and what it does not}
 
-At first glance, a 32-layer snake suggests an obvious target: in steady state,
-why not keep 32 microbatches in flight, one per tile? The answer is that layer
-count and safe pipeline occupancy are not the same thing in the current
-runtime model.
+At steady state, \code{stream\_depth=32} finally realizes the intuitive
+conveyor-belt picture for this 32-layer snake: each compute tile can be working
+on a different $B=8$ microbatch at the same time. That is the occupancy target
+the earlier finite-task runtime could not safely reach.
 
-The present implementation still uses finite host-scheduled chunks with
-host-visible fills and drains, plus small activation FIFOs between layers. That
-is enough to validate meaningful in-array overlap, but it is not yet the same
-as a true free-running producer/consumer service with ring buffers and
-persistent backpressure management. On the full $H=160$ path, the current
-control pattern is stable through \code{stream\_depth=6}; depths 7 and 8
-already time out. In other words, the limiting factor is currently the
-interaction between runtime scheduling, FIFO depth, and backpressure, not the
-existence of 32 layers in the abstract.
+What this does \emph{not} mean is that the whole MNIST inference graph is now
+on the NPU. The current public streaming path still keeps image flattening,
+embedding, and the classifier head on the CPU; the NPU owns the 32-layer
+residual body. In practice, that CPU work is modest compared with the residual
+body arithmetic, and the dominant systems win comes from keeping the body
+resident and continuously fed. Moving the endpoints onto the NPU remains a
+separate architectural choice, not a prerequisite for validating the deep
+streaming runtime itself.
 
 This is still a strong result. The new path reaches a record throughput in this
 repository while keeping the design conceptually modest:
@@ -1054,12 +1074,16 @@ repository while keeping the design conceptually modest:
   \item no host weight BO for the residual body,
   \item one checkpoint-specific inference XCLBIN,
   \item one explicit scalar knob, \code{stream\_depth}, controlling the amount
-        of in-array overlap.
+        of in-array overlap,
+  \item one repeated shim DMA fill and one repeated shim DMA drain per call,
+        rather than one host DMA task per microbatch.
 \end{itemize}
 
 That is exactly the kind of systems win worth keeping in the main branch: a
-clear design, a measured throughput story, and a remaining limitation that is
-specific enough to guide the next round of work.
+clear design and a measured throughput story. The remaining limitation is now a
+much better one to have: not ``can depth 32 work at all?'', but ``how much more
+of the surrounding graph should move on-array, and how much closer to peak can
+this runtime contract go?''.
 
 \section{Compact glossary}
 

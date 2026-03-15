@@ -3,6 +3,11 @@ IRON design for forward-only residual MLP streaming inference with embedded weig
 
 Each tile gets a compile-time initialized local weight buffer, so repeated host
 calls only stream activations in and activations out.
+
+For deeper resident chunks, the host boundary uses one repeated shim DMA fill
+and one repeated shim DMA drain task instead of issuing one host DMA task per
+microbatch. Tile-local activation FIFOs stay at depth 2, so the design keeps
+the original SRAM footprint while reducing runtime task pressure.
 """
 
 from pathlib import Path
@@ -23,7 +28,7 @@ def snake_streaming_pipeline(
     H=160,
     B=8,
     num_cols=8,
-    stream_depth=6,
+    stream_depth=32,
     archive_name="resmlp_streaming_kernel.a",
     weights_path=None,
 ):
@@ -45,6 +50,7 @@ def snake_streaming_pipeline(
     act_ty = np.ndarray[(B * H,), np.dtype[bfloat16]]
     wt_ty = np.ndarray[(H * H,), np.dtype[bfloat16]]
     fifo_depth = 1 if stream_depth == 1 else 2
+    host_chunk_ty = np.ndarray[(stream_depth, B, H), np.dtype[bfloat16]]
 
     kernel = Kernel(
         "matmul_relu_skip_infer_bf16",
@@ -97,32 +103,20 @@ def snake_streaming_pipeline(
             )
         )
 
-    host_act_ty = np.ndarray[(stream_depth * B * H,), np.dtype[bfloat16]]
-    host_out_ty = np.ndarray[(stream_depth * B * H,), np.dtype[bfloat16]]
-
-    def act_tap(batch_idx: int) -> TensorAccessPattern:
-        return TensorAccessPattern(
-            (1, stream_depth * B * H),
-            batch_idx * B * H,
-            [1, B * H],
-            [0, 1],
-        )
+    stream_tap = TensorAccessPattern(
+        (stream_depth, B, H),
+        0,
+        [stream_depth, 1, B, H],
+        [B * H, 0, H, 1],
+    )
 
     rt = Runtime()
-    with rt.sequence(host_act_ty, host_out_ty) as (inp, out):
+    with rt.sequence(host_chunk_ty, host_chunk_ty) as (inp, out):
         rt.start(*workers)
 
         tg = rt.task_group()
-        for batch_idx in range(stream_depth):
-            tap = act_tap(batch_idx)
-            rt.fill(act_in.prod(), inp, tap=tap, task_group=tg)
-            rt.drain(
-                act_out.cons(),
-                out,
-                tap=tap,
-                wait=True,
-                task_group=tg,
-            )
+        rt.fill(act_in.prod(), inp, tap=stream_tap, task_group=tg)
+        rt.drain(act_out.cons(), out, tap=stream_tap, wait=True, task_group=tg)
         rt.finish_task_group(tg)
 
     return Program(NPU2(), rt).resolve_program(SequentialPlacer())
@@ -135,7 +129,7 @@ if __name__ == "__main__":
     p.add_argument("--H", type=int, default=160)
     p.add_argument("--B", type=int, default=8)
     p.add_argument("--cols", type=int, default=8)
-    p.add_argument("--stream-depth", type=int, default=6)
+    p.add_argument("--stream-depth", type=int, default=32)
     p.add_argument("--weights-path", required=True)
     p.add_argument("-o", "--output", default="build/resmlp_streaming.mlir")
     args = p.parse_args()
