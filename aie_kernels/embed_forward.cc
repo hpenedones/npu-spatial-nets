@@ -79,4 +79,72 @@ void embed_forward_bf16(bfloat16 *x, bfloat16 *w, bfloat16 *y, int32_t clear_y)
     }
 }
 
+void embed_forward_full_bf16(
+    bfloat16 *x_chunk,
+    bfloat16 *w_full,
+    bfloat16 *y,
+    int32_t chunk_idx,
+    int32_t clear_y)
+{
+    static_assert(DIM_M % 8 == 0, "Batch must be multiple of 8");
+    static_assert(DIM_K_EMBED % 8 == 0, "Input dim must be multiple of 8");
+    static_assert(DIM_H % 8 == 0, "Hidden dim must be multiple of 8");
+
+    const int chunk_elems = DIM_K_EMBED * DIM_H;
+    bfloat16 *w = w_full + chunk_idx * chunk_elems;
+
+    alignas(32) bfloat16 partial[DIM_M * DIM_H];
+    static_assert((DIM_M * DIM_H) % 32 == 0, "Output elements must be divisible by 32");
+
+    matmul_plain<bfloat16, (DIM_M / 8), (DIM_K_EMBED / 8), (DIM_H / 8)>(x_chunk, w, partial);
+
+    if (clear_y) {
+        for (int i = 0; i < DIM_M * DIM_H; i += 32) {
+            auto v = aie::load_v<32>(partial + i);
+            aie::store_v(y + i, v);
+        }
+        return;
+    }
+
+    for (int i = 0; i < DIM_M * DIM_H; i += 32) {
+        auto vy = aie::load_v<32>(y + i);
+        auto vp = aie::load_v<32>(partial + i);
+        aie::store_v(y + i, aie::add(vy, vp));
+    }
+}
+
+void embed_forward_resident_bf16(bfloat16 *x_full, bfloat16 *w_full, bfloat16 *y)
+{
+    static_assert(DIM_M % 8 == 0, "Batch must be multiple of 8");
+    static_assert(DIM_K_EMBED % 8 == 0, "Input dim must be multiple of 8");
+    static_assert(DIM_H % 8 == 0, "Hidden dim must be multiple of 8");
+
+    constexpr int num_chunks = 784 / DIM_K_EMBED;
+    constexpr int x_chunk_elems = DIM_M * DIM_K_EMBED;
+    constexpr int w_chunk_elems = DIM_K_EMBED * DIM_H;
+
+    alignas(32) bfloat16 partial[DIM_M * DIM_H];
+    static_assert((DIM_M * DIM_H) % 32 == 0, "Output elements must be divisible by 32");
+
+    for (int chunk_idx = 0; chunk_idx < num_chunks; ++chunk_idx) {
+        bfloat16 *x = x_full + chunk_idx * x_chunk_elems;
+        bfloat16 *w = w_full + chunk_idx * w_chunk_elems;
+        matmul_plain<bfloat16, (DIM_M / 8), (DIM_K_EMBED / 8), (DIM_H / 8)>(x, w, partial);
+
+        if (chunk_idx == 0) {
+            for (int i = 0; i < DIM_M * DIM_H; i += 32) {
+                auto v = aie::load_v<32>(partial + i);
+                aie::store_v(y + i, v);
+            }
+            continue;
+        }
+
+        for (int i = 0; i < DIM_M * DIM_H; i += 32) {
+            auto vy = aie::load_v<32>(y + i);
+            auto vp = aie::load_v<32>(partial + i);
+            aie::store_v(y + i, aie::add(vy, vp));
+        }
+    }
+}
+
 } // extern "C"

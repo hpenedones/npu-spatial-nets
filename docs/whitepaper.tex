@@ -292,14 +292,14 @@ the CPU again, we project the final hidden state to ten logits.
   \draw[arrow] (snake) -- (head);
   \draw[arrow] (head) -- (out);
 \end{tikzpicture}}
-\caption{Host/NPU split in the current implementation: CPU embedding, 32 NPU residual layers, then a CPU classification head.}
+\caption{Host/NPU split in the main $H=160$ streaming path: CPU embedding, 32 NPU residual layers, then a CPU classification head.}
 \label{fig:model-overview}
 \end{figure}
 
-This split is not arbitrary. The embedding and head are small and convenient to
-keep on the CPU. The hidden stack is the repetitive part: it is where a tile
-array is easiest to use well, because the same buffer shape recurs 32
-times.
+For the main $H=160$ streaming path, this split is not arbitrary. The embedding
+and head are small and convenient to keep on the CPU. The hidden stack is the
+repetitive part: it is where a tile array is easiest to use well, because the
+same buffer shape recurs 32 times.
 
 The PyTorch model in \code{resmlp/model.py} is therefore almost identical to the
 hardware view:
@@ -1051,6 +1051,12 @@ benchmark, the same depth-32 configuration sustains about 1.51 million
 images/s wall-clock and about 1.59 million images/s if only kernel wait time is
 counted, or roughly 2.47 / 2.60 TFLOPS.
 
+These figures intentionally isolate the resident residual body. The public
+Python inference service still has to do endpoint work on the host --- at
+minimum layout conversion, and in the current $H=160$ path also the image
+embedding and classifier head --- so end-to-end MNIST throughput is lower than
+the body-only upper bound above.
+
 \subsection{What depth 32 means --- and what it does not}
 
 At steady state, \code{stream\_depth=32} finally realizes the intuitive
@@ -1059,13 +1065,57 @@ on a different $B=8$ microbatch at the same time. That is the occupancy target
 the earlier finite-task runtime could not safely reach.
 
 What this does \emph{not} mean is that the whole MNIST inference graph is now
-on the NPU. The current public streaming path still keeps image flattening,
-embedding, and the classifier head on the CPU; the NPU owns the 32-layer
-residual body. In practice, that CPU work is modest compared with the residual
-body arithmetic, and the dominant systems win comes from keeping the body
-resident and continuously fed. Moving the endpoints onto the NPU remains a
-separate architectural choice, not a prerequisite for validating the deep
-streaming runtime itself.
+on the NPU. The current public $H=160$ streaming path still keeps image
+flattening, embedding, and the classifier head on the CPU; the NPU owns the
+32-layer residual body. That was enough to validate the repeated-BD runtime and
+prove that depth 32 gives genuine in-array overlap, but it is not a free
+endpoint story: the residual-body measurements above are best read as the
+throughput ceiling of the resident snake itself, not as the wall-clock
+throughput of the full host-visible inference service.
+
+\subsection{End-to-end speedups versus pure CPU inference}
+
+To keep the throughput story honest, it helps to compare the full host-visible
+inference path against a plain PyTorch CPU baseline on the same machine.
+Table~\ref{tab:cpu-vs-npu-inference} includes the CPU-side endpoint work that
+still exists today: embedding and head for the main $H=160$ split, and the CPU
+head for the narrower $H=32$ embed-on-tile-0 prototype.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+Path & Hidden dim & Img/s & Speedup vs pure CPU \\
+\midrule
+Pure CPU eager inference & 160 & 140{,}658 & 1.0$\times$ \\
+CPU embed + 32-tile NPU body + CPU head & 160 & 413{,}196 & 2.9$\times$ \\
+\addlinespace
+Pure CPU eager inference & 32 & 824{,}670 & 1.0$\times$ \\
+NPU embed + 31-tile NPU body + CPU head & 32 & 413{,}664 & 0.50$\times$ \\
+\bottomrule
+\end{tabular}
+\caption{End-to-end inference throughput on the same host. The pure CPU rows use
+the best measured PyTorch thread count on this machine (12 threads for
+$H=160$, 2 threads for $H=32$). The NPU rows include the host-side boundary
+work that still remains in the current Python service path.}
+\label{tab:cpu-vs-npu-inference}
+\end{table}
+
+The conclusion is encouraging, but also clarifying. For the original
+$H=160$ design, the NPU path still delivers a real end-to-end gain of roughly
+$2.9\times$ over pure CPU inference on this host. The resident 32-tile snake is
+therefore not just a pretty internal benchmark; it does translate into a
+visible wall-clock speedup even after host-side boundary work is included.
+
+The $H=32$ prototype tells a different story. Moving the first layer onto tile
+0 is architecturally clean and it does work reliably at
+\code{stream\_depth=32}, but it is not yet a throughput win. The first tile now
+spends real time on the $784 \rightarrow 32$ projection, and the service still
+has to untile the final hidden state and run the classifier head on the CPU. In
+other words, endpoint migration is not automatically synonymous with higher
+throughput; it only helps if the new on-array stage is cheaper than the host
+work it replaces.
 
 This is still a strong result. The new path reaches a record throughput in this
 repository while keeping the design conceptually modest:
