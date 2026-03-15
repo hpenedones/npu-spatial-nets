@@ -16,6 +16,8 @@ from iron.common import (
     PythonGeneratedMLIRArtifact,
 )
 
+from resmlp.artifact_utils import source_fingerprint
+
 ROWS_PER_COL = 4
 
 
@@ -34,16 +36,30 @@ class ResMLP(AIEOperatorBase):
         operator_dir = Path(__file__).parent
         project_dir = operator_dir.parent  # npu-spatial-nets root
         H, B = self.H, self.B
+        kernels_dir = project_dir / "aie_kernels"
+
+        kernel_fp = source_fingerprint(kernels_dir / "matmul_relu_skip.cc")
+        build_fp = source_fingerprint(
+            operator_dir / "design.py",
+            operator_dir / "op.py",
+            kernels_dir / "matmul_relu_skip.cc",
+        )
+        kernel_tag = f"b{B}_h{H}_{kernel_fp}"
+        archive_name = f"{prefix}kernel_{kernel_tag}.a"
 
         mlir_artifact = PythonGeneratedMLIRArtifact.new(
-            f"{prefix}{B}x{H}_{self.num_cols}col.mlir",
+            f"{prefix}{B}x{H}_{self.num_cols}col_{build_fp}.mlir",
             import_path=operator_dir / "design.py",
             callback_fn="snake_pipeline",
-            callback_kwargs={"H": H, "B": B, "num_cols": self.num_cols},
+            callback_kwargs={
+                "H": H,
+                "B": B,
+                "num_cols": self.num_cols,
+                "archive_name": archive_name,
+            },
             requires_context=False,
         )
 
-        archive_name = f"{prefix}kernel.a"
         kernel_flags = [
             f"-DDIM_M={B}",
             f"-DDIM_K={H}",
@@ -52,18 +68,18 @@ class ResMLP(AIEOperatorBase):
         ]
 
         xclbin_artifact = XclbinArtifact.new(
-            f"{prefix}{B}x{H}_{self.num_cols}col.xclbin",
+            f"{prefix}{B}x{H}_{self.num_cols}col_{build_fp}.xclbin",
             depends=[
                 mlir_artifact,
                 KernelArchiveArtifact.new(
                     archive_name,
                     depends=[
                         KernelObjectArtifact.new(
-                            f"{prefix}kernel.o",
+                            f"{prefix}kernel_{kernel_tag}.o",
                             extra_flags=kernel_flags,
                             depends=[
                                 SourceArtifact.new(
-                                    project_dir / "aie_kernels" / "matmul_relu_skip.cc"
+                                    kernels_dir / "matmul_relu_skip.cc"
                                 )
                             ],
                         )
@@ -73,7 +89,7 @@ class ResMLP(AIEOperatorBase):
         )
 
         insts_artifact = InstsBinArtifact.new(
-            f"{prefix}{B}x{H}_{self.num_cols}col.bin",
+            f"{prefix}{B}x{H}_{self.num_cols}col_{build_fp}.bin",
             depends=[mlir_artifact],
         )
 

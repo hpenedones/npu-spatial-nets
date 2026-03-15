@@ -36,7 +36,7 @@ def snake_tile_order(num_cols):
     return tiles
 
 
-def snake_pipeline(H=160, B=8, num_cols=8):
+def snake_pipeline(H=160, B=8, num_cols=8, archive_name="resmlp_kernel.a"):
     """Generate an IRON program for the residual MLP snake pipeline.
 
     Args:
@@ -59,7 +59,7 @@ def snake_pipeline(H=160, B=8, num_cols=8):
 
     # ── Kernel ───────────────────────────────────────────────────────
     kernel = Kernel(
-        "matmul_relu_skip_bf16", "resmlp_kernel.a",
+        "matmul_relu_skip_infer_bf16", archive_name,
         [act_ty, wt_ty, act_ty],
     )
 

@@ -254,7 +254,7 @@ Constraint & Why it matters & Choice in this project \\
 8$\times$8 MMUL-friendly layout & Host tensors must be packed in blocked layout; dimensions should be multiples of 8 & Choose $B=8$ and $H=160$; use \code{to\_tiled()} / \code{from\_tiled()} \\
 Explicit routing & Every inter-tile handoff has to be representable as a FIFO / route & Use a single snake of plain \code{ObjectFifo}s across all 32 tiles \\
 Invocation overhead & Small calls waste hardware; fixed overhead dominates when the batch is tiny & Accept this for clarity; frame \code{B=8} as pedagogical, not peak-throughput \\
-Current runtime semantics & Weights are written once per NPU call, not kept resident across many calls & Weight-stationary during a call; persistent weights remain future work \\
+Current runtime semantics & Finite XRT calls still shape the schedule, but inference no longer needs per-call weight DMA & Use checkpoint-specific inference XCLBINs with embedded tile-local weights; validated deep streaming up to \code{stream\_depth=6} on the full $H=160$ path \\
 \bottomrule
 \end{tabularx}
 \caption{This is the minimal constraint set needed to understand the rest of the document. Anything else belongs in an appendix, the code, or the logbook.}
@@ -935,6 +935,131 @@ validated against a quantized CPU replay, run stably for many epochs, and now
 also execute short resident windows with measurably lower host overhead. The
 remaining work is now about model quality and true in-array overlap, not
 whether the basic forward/backward/update path is functioning.
+
+\section{Deep streaming residual inference}
+
+The most encouraging recent result is that the repository now has a genuinely
+useful inference-only streaming path for the original 32-tile residual snake.
+The key simplification is to stop treating inference like training. For
+training, weights and ReLU state need to move in and out of the array and the
+host has to preserve backward-facing context. For inference, none of that is
+necessary. Each tile can simply hold its own fixed checkpoint weight matrix in
+SRAM, consume one activation microbatch, emit one activation microbatch, and do
+so repeatedly.
+
+This gives a design that is still easy to describe:
+\begin{itemize}
+  \item the CPU keeps the image flattening, embedding, and classifier head,
+  \item the NPU keeps the 32-layer residual body,
+  \item each compute tile stores one blocked $160\times160$ bf16 weight matrix
+        as a compile-time initialized local \code{Buffer},
+  \item the host-facing runtime contract shrinks to just \code{input} and
+        \code{output} buffers,
+  \item repeated calls reuse the same instructions and the same embedded
+        weights, so the host no longer re-sends the residual body parameters
+        every batch.
+\end{itemize}
+
+\subsection{What changed in the implementation}
+
+Two details mattered much more than they first appeared.
+
+First, inference needed its own kernel entrypoint. The original
+\code{matmul\_relu\_skip.cc} kernel had been extended for training so that it
+could also write a ReLU mask for the backward pass. That is correct for the
+training graph, but inference only wants the three logical tensors
+\code{(a, w, c)}. Reusing the five-argument training entrypoint in an
+inference graph silently scribbled mask data into unrelated buffers and made
+deep streaming look unstable long before the dataflow itself was the real
+problem. The final solution is a dedicated three-argument
+\code{matmul\_relu\_skip\_infer\_bf16} wrapper for inference while preserving
+the mask-writing entrypoint for training.
+
+Second, artifact naming had to become more disciplined. Once the same source
+file can produce both training and inference entrypoints across several hidden
+sizes, short names like ``\code{resmlp\_kernel.a}'' or
+``\code{resmlp\_streaming\_kernel.a}'' are no longer safe. The current
+operators fingerprint the relevant Python design files, kernel source, and, for
+streaming inference, the packed checkpoint weights themselves. That avoids the
+particularly confusing failure mode where an apparently fresh rebuild links a
+stale object compiled for a different hidden size or ABI.
+
+\subsection{From resident weights to deep streaming}
+
+With weights embedded, the first gain is easy to understand: even at
+\code{stream\_depth=1}, the design is already much faster than the old one-shot
+path because the host no longer pushes all 32 layer weights through DDR and the
+MemTiles on every call. The next step is to let one call carry several
+microbatches. In the current implementation, \code{stream\_depth} means exactly
+that: how many $B=8$ activation microbatches are fed through the snake before
+control returns to the host.
+
+Importantly, this is still not a fully free-running conveyor belt. The runtime
+issues a finite sequence of fills and drains, and the workers consume a finite
+number of activation tokens per call. But inside that finite chunk, the array
+does behave like a layered pipeline: while later tiles are working on older
+microbatches, earlier tiles can already start the next ones. The measured
+throughput scaling confirms that this overlap is real.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lrrrr@{}}
+\toprule
+Mode & Images / call & Img/s & ms/call & Speedup vs one-shot \\
+\midrule
+One-shot residual inference & 8 & 35{,}026 & 0.228 & 1.0$\times$ \\
+Embedded streaming, depth 1 & 8 & 68{,}412 & 0.117 & 2.0$\times$ \\
+Embedded streaming, depth 2 & 16 & 135{,}276 & 0.118 & 3.9$\times$ \\
+Embedded streaming, depth 4 & 32 & 259{,}224 & 0.123 & 7.4$\times$ \\
+Embedded streaming, depth 6 & 48 & 372{,}201 & 0.129 & 10.6$\times$ \\
+\bottomrule
+\end{tabular}
+\caption{Full $H=160$, $B=8$, 8-column / 32-tile residual body on hardware.
+The one-shot baseline and all streaming rows use the same arithmetic workload;
+only the host/runtime contract changes.}
+\label{tab:deep-streaming-resmlp}
+\end{table}
+
+These numbers matter for two reasons. First, they show that resident weights
+alone are already worthwhile: depth 1 is about twice as fast as the old
+one-shot path. Second, the near-linear gain from depth 1 to depth 6 shows that
+multiple microbatches really are overlapping in the array rather than merely
+waiting in host memory. In a longer sustained run, the depth-6 configuration
+processed 10{,}000{,}032 images in about 26.35 s, which is about
+379k images/s wall-clock throughput and about 407k images/s if only the
+kernel wait time is counted.
+
+\subsection{Why the current ceiling is depth 6, not depth 32}
+
+At first glance, a 32-layer snake suggests an obvious target: in steady state,
+why not keep 32 microbatches in flight, one per tile? The answer is that layer
+count and safe pipeline occupancy are not the same thing in the current
+runtime model.
+
+The present implementation still uses finite host-scheduled chunks with
+host-visible fills and drains, plus small activation FIFOs between layers. That
+is enough to validate meaningful in-array overlap, but it is not yet the same
+as a true free-running producer/consumer service with ring buffers and
+persistent backpressure management. On the full $H=160$ path, the current
+control pattern is stable through \code{stream\_depth=6}; depths 7 and 8
+already time out. In other words, the limiting factor is currently the
+interaction between runtime scheduling, FIFO depth, and backpressure, not the
+existence of 32 layers in the abstract.
+
+This is still a strong result. The new path reaches a record throughput in this
+repository while keeping the design conceptually modest:
+\begin{itemize}
+  \item no backward pass,
+  \item no host weight BO for the residual body,
+  \item one checkpoint-specific inference XCLBIN,
+  \item one explicit scalar knob, \code{stream\_depth}, controlling the amount
+        of in-array overlap.
+\end{itemize}
+
+That is exactly the kind of systems win worth keeping in the main branch: a
+clear design, a measured throughput story, and a remaining limitation that is
+specific enough to guide the next round of work.
 
 \section{Compact glossary}
 
