@@ -11,10 +11,11 @@ from torchvision import datasets, transforms
 
 from iron.common.aie_context import AIEContext
 
-from resmlp import from_tiled, to_tiled
+from resmlp import to_tiled
 from resmlp.model import ResMLP
 from resmlp.design import ROWS_PER_COL
-from resmlp.streaming_op import StreamingResMLP
+from resmlp.streaming_logits_design import N_CLS_PADDED, NUM_CLASSES
+from resmlp.streaming_logits_op import StreamingResMLPLogits
 
 
 class ResidualStreamingInferenceService:
@@ -46,8 +47,6 @@ class ResidualStreamingInferenceService:
 
         self.embed_weight = self.model.embed.weight.detach().float()
         self.embed_bias = self.model.embed.bias.detach().float()
-        self.head_weight = self.model.head.weight.detach().float()
-        self.head_bias = self.model.head.bias.detach().float()
         residual_weights = self.model.export_residual_weights()
 
         if self.num_layers == self.num_tiles - 2:
@@ -57,11 +56,20 @@ class ResidualStreamingInferenceService:
         self.packed_weights_by_tile = np.stack(
             [np.asarray(to_tiled(w), dtype=bfloat16) for w in residual_weights]
         )
+        self.packed_head_weight = np.asarray(
+            to_tiled(self.model.export_head_weight(padded_classes=N_CLS_PADDED)),
+            dtype=bfloat16,
+        )
+        head_bias = self.model.head.bias.detach().cpu().float().numpy()
+        self.packed_head_bias = np.zeros((N_CLS_PADDED,), dtype=bfloat16)
+        self.packed_head_bias[:NUM_CLASSES] = head_bias.astype(bfloat16)
         self.zero_hidden = np.zeros((self.B, self.hidden_dim), dtype=bfloat16)
 
         ctx = AIEContext(use_runlist=False)
-        self.npu_op = StreamingResMLP(
+        self.npu_op = StreamingResMLPLogits(
             self.packed_weights_by_tile,
+            self.packed_head_weight,
+            self.packed_head_bias,
             H=self.hidden_dim,
             B=self.B,
             num_cols=self.num_cols,
@@ -86,20 +94,22 @@ class ResidualStreamingInferenceService:
         self.npu_op.write_buffer("input", packed_input)
         elapsed = self.npu_op.run_stream()
 
-        y_flat = self.npu_op.read_buffer(
+        logits_flat = self.npu_op.read_buffer(
             "output",
-            (self.stream_depth * self.B * self.hidden_dim,),
+            (self.stream_depth * self.B * N_CLS_PADDED,),
             copy=True,
         )
         outputs = []
         for idx in range(valid):
-            start = idx * self.B * self.hidden_dim
-            stop = (idx + 1) * self.B * self.hidden_dim
-            outputs.append(from_tiled(y_flat[start:stop], self.B, self.hidden_dim).astype(np.float32))
+            start = idx * self.B * N_CLS_PADDED
+            stop = (idx + 1) * self.B * N_CLS_PADDED
+            outputs.append(
+                logits_flat[start:stop].reshape(self.B, N_CLS_PADDED)[:, :NUM_CLASSES].astype(np.float32)
+            )
         return outputs, elapsed
 
     def process_hidden_stream(self, hidden_batch_iter):
-        """Yield hidden outputs forever (or until the iterator ends)."""
+        """Yield logits forever (or until the iterator ends)."""
         while True:
             batch_group = []
             try:
@@ -111,9 +121,9 @@ class ResidualStreamingInferenceService:
             if not batch_group:
                 return
 
-            outputs, _ = self.process_hidden_chunk(batch_group)
-            for output in outputs:
-                yield output
+            logits_group, _ = self.process_hidden_chunk(batch_group)
+            for logits in logits_group:
+                yield logits
 
     def process_image_stream(self, image_batch_iter):
         """Yield logits/preds for an arbitrary-length image batch iterator."""
@@ -123,9 +133,8 @@ class ResidualStreamingInferenceService:
                 x_hidden = (x_flat @ self.embed_weight.T + self.embed_bias).numpy()
                 yield x_hidden.astype(bfloat16)
 
-        for hidden_out in self.process_hidden_stream(iter(hidden_iter())):
-            logits = torch.from_numpy(hidden_out) @ self.head_weight.T + self.head_bias
-            yield logits
+        for logits in self.process_hidden_stream(iter(hidden_iter())):
+            yield torch.from_numpy(logits)
 
 
 def mnist_batch_iterator(dataset, batch_size):
@@ -214,13 +223,11 @@ def main():
         npu_time += elapsed
         npu_calls += 1
 
-        t_cpu0 = time.perf_counter()
-        for hidden_out, (labels, actual_b) in zip(outputs, labels_meta):
-            logits = torch.from_numpy(hidden_out) @ service.head_weight.T + service.head_bias
+        for logits_np, (labels, actual_b) in zip(outputs, labels_meta):
+            logits = torch.from_numpy(logits_np)
             preds = logits[:actual_b].argmax(1)
             correct += (preds == labels).sum().item()
             total += actual_b
-        cpu_time += time.perf_counter() - t_cpu0
 
     accuracy = correct / total if total else 0.0
     print(f"\n{'═' * 50}")
