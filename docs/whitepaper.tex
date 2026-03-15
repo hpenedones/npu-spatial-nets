@@ -80,17 +80,21 @@ for MNIST:
 \[
   h_{\ell+1} = \mathrm{ReLU}(h_{\ell} W_{\ell}) + h_{\ell}, \qquad \ell=0,\dots,31.
 \]
-Each of the 32 compute tiles stores exactly one weight matrix. The host CPU
-runs the input embedding and the final classification head. The NPU runs the
-32 hidden layers in one call.
+Each of the 32 compute tiles stores exactly one residual weight matrix. In the
+main public $H=160$ split, the host CPU still runs the input embedding, while
+the NPU runs all 32 hidden layers and the final classification head in one
+streamed service.
 
-The result is a didactic but fully working example:
+The result is now a family of didactic but fully working examples:
 \begin{itemize}
-  \item the CPU model reaches about 97.1\% MNIST test accuracy,
-  \item the NPU implementation reaches 97.2\%,
-  \item the NPU stage runs at about 24,114 images/s for batches of 8,
-  \item a device-side benchmark reports about 55 GFLOPS for the 32-tile
-        snake pipeline.
+  \item the main $H=160$ end-to-end path reaches about 488{,}597 images/s,
+        or roughly $3.5\times$ over pure CPU inference on the same host,
+  \item the resident $H=160$, $B=8$ residual body reaches about 1.46 million
+        images/s wall-clock at \code{stream\_depth=32}, or about 2.39 TFLOPS,
+  \item a narrower throughput-oriented $H=96$, $B=56$ variant reaches about
+        97.3\% validation accuracy on a 50k/10k train/validation split, about
+        739k images/s wall-clock in the current host-visible service, and about
+        3.88 million images/s if only NPU kernel wait time is counted.
 \end{itemize}
 
 These numbers are intentionally modest relative to the NPU's peak. The current
@@ -265,10 +269,12 @@ Current runtime semantics & Finite XRT calls still shape the schedule, but infer
 
 \subsection{Model overview}
 
-The current model is intentionally plain. On the CPU, we flatten a 28$\times$28
-MNIST image and project it to a 160-dimensional hidden state. On the NPU,
-we apply 32 copies of the same layer shape, each with its own weights. On
-the CPU again, we project the final hidden state to ten logits.
+The current model is intentionally plain. In the main $H=160$ streaming path,
+the CPU flattens a 28$\times$28 MNIST image and projects it to a
+160-dimensional hidden state. On the NPU, we apply 32 copies of the same layer
+shape, each with its own weights, and the final tile also projects the last
+hidden state to ten logits. A later subsection revisits the same 32-layer
+template at a narrower, higher-batch operating point ($H=96$, $B=56$).
 
 \begin{figure}[t]
 \centering
@@ -1121,8 +1127,43 @@ other words, endpoint migration is not automatically synonymous with higher
 throughput; it only helps if the new on-array stage is cheaper than the host
 work it replaces.
 
-This is still a strong result. The new path reaches a record throughput in this
-repository while keeping the design conceptually modest:
+\subsection{A throughput-oriented \texorpdfstring{$H=96$, $B=56$}{H=96, B=56} point}
+
+The same 32-layer residual template can also be pushed toward a more
+throughput-friendly point on the SRAM frontier by narrowing the hidden state and
+growing the microbatch. The best current example uses a
+$784 \rightarrow 96$ embedding, 32 residual layers of shape $96\times96$, and a
+$96 \rightarrow 10$ head. That model has $784\cdot96 + 96 = 75{,}360$
+parameters in the embed, $32\cdot96\cdot96 = 294{,}912$ in the residual body,
+and $96\cdot10 + 10 = 970$ in the head, for a total of 371{,}242 trainable
+parameters. One forward pass costs about 742{,}272 FLOPs/image if only the
+matrix multiplies are counted, or about 748{,}522 scalar floating-point
+operations/image if bias adds, ReLUs, and residual adds are included.
+
+On a 50k/10k MNIST train/validation split, a simple CPU-trained checkpoint
+reaches 97.27\% validation accuracy, and the streamed inference service
+reproduces 97.25\% through the NPU residual body. Using $B=56$ and
+\code{stream\_depth=32}, the repeated-image service benchmark processes about
+739{,}473 images/s wall-clock in the current host-visible path and about 3.88
+million images/s if only NPU kernel wait time is counted, corresponding to
+about 0.55 / 2.91 TFLOPS if the whole network forward pass is charged to the
+measurement. For this shape the public fused logits tail is not yet stable, so
+the present benchmark uses the correct body-only streamer with CPU embedding and
+CPU head in the Python service loop.
+
+We do \emph{not} claim this is a universal literature record. Direct MNIST
+throughput comparisons are surprisingly scarce and often differ in model family,
+quantization, batching, or whether host-side work is included at all. Public
+benchmark collections such as QuTiBench and GPU/TPU batch-size studies report
+MNIST inference regimes in the hundreds of thousands of images/s on very
+different systems \cite{qutibench-mnist,batch-size-gpu-tpu}. Our measured
+wall-clock figure therefore appears to be at least at the high end of the
+public MNIST throughput numbers we could find, but it should be read as a
+strong data point rather than an apples-to-apples claim of beating every
+published result.
+
+Taken together, these results are still strong while keeping the design
+conceptually modest:
 \begin{itemize}
   \item no backward pass,
   \item no host weight BO for the residual body,
@@ -1205,6 +1246,14 @@ AMD, \emph{AI Engine documentation (programming model and architecture)}.\newlin
 \bibitem{amd-xdna-wiki}
 \emph{AMD XDNA overview}.\newline
 \url{https://en.wikipedia.org/wiki/AMD_XDNA}
+
+\bibitem{qutibench-mnist}
+M. Blott et al., \emph{QuTiBench MNIST classification benchmark collection}.\newline
+\url{https://rcl-lab.github.io/QutibenchWeb/mnist/rooflines/performance%20prediction/2020/03/25/MNIST_Classification.html}
+
+\bibitem{batch-size-gpu-tpu}
+Y. Gordienko et al., \emph{Batch Size Influence on Performance of Graphic and Tensor Processing Units During Training and Inference Phases}.\newline
+\url{https://link.springer.com/chapter/10.1007/978-3-030-16621-2_61}
 
 \end{thebibliography}
 

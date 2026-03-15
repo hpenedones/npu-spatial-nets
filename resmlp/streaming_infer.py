@@ -1,38 +1,62 @@
 """Streaming inference service for the residual MLP NPU path."""
 
 import argparse
+import math
 import sys
 import time
+from pathlib import Path
 
 import numpy as np
 import torch
 from ml_dtypes import bfloat16
-from torchvision import datasets, transforms
 
 from iron.common.aie_context import AIEContext
 
-from resmlp import to_tiled
+from resmlp import from_tiled, to_tiled
+from resmlp.mnist_utils import (
+    DEFAULT_SPLIT_SEED,
+    DEFAULT_VAL_SIZE,
+    get_mnist_eval_dataset,
+    save_prediction_preview,
+)
 from resmlp.model import ResMLP
 from resmlp.design import ROWS_PER_COL
 from resmlp.streaming_logits_design import N_CLS_PADDED, NUM_CLASSES
 from resmlp.streaming_logits_op import StreamingResMLPLogits
+from resmlp.streaming_op import StreamingResMLP
 
 
 class ResidualStreamingInferenceService:
     """Host-facing infinite stream API over repeated multi-microbatch NPU chunks."""
 
-    def __init__(self, checkpoint, *, hidden_dim=None, num_layers=None, num_cols=8, stream_depth=32):
-        self.B = 8
+    def __init__(
+        self,
+        checkpoint,
+        *,
+        hidden_dim=None,
+        num_layers=None,
+        batch_size=None,
+        npu_head=True,
+        num_cols=8,
+        stream_depth=32,
+    ):
+        ckpt = torch.load(checkpoint, map_location="cpu", weights_only=True)
+        self.B = batch_size if batch_size is not None else ckpt.get("npu_batch_size", 8)
         self.num_cols = num_cols
         self.num_tiles = num_cols * ROWS_PER_COL
         self.stream_depth = stream_depth
-
-        ckpt = torch.load(checkpoint, map_location="cpu", weights_only=True)
+        self.npu_head = npu_head
         self.hidden_dim = hidden_dim if hidden_dim is not None else ckpt.get("hidden_dim", 160)
         self.num_layers = num_layers if num_layers is not None else ckpt.get("num_layers", 32)
         self.pipeline = ckpt.get("pipeline", "hybrid")
         self.epoch = ckpt["epoch"]
-        self.test_acc = ckpt.get("test_acc", None)
+        self.eval_split = ckpt.get("eval_split", "test")
+        self.val_size = ckpt.get("val_size", DEFAULT_VAL_SIZE)
+        self.split_seed = ckpt.get("split_seed", DEFAULT_SPLIT_SEED)
+        self.saved_eval_acc = ckpt.get(
+            f"{self.eval_split}_acc",
+            ckpt.get("val_acc", ckpt.get("test_acc")),
+        )
 
         if self.num_layers not in {self.num_tiles, self.num_tiles - 2}:
             raise ValueError(
@@ -56,28 +80,44 @@ class ResidualStreamingInferenceService:
         self.packed_weights_by_tile = np.stack(
             [np.asarray(to_tiled(w), dtype=bfloat16) for w in residual_weights]
         )
-        self.packed_head_weight = np.asarray(
-            to_tiled(self.model.export_head_weight(padded_classes=N_CLS_PADDED)),
-            dtype=bfloat16,
-        )
-        head_bias = self.model.head.bias.detach().cpu().float().numpy()
-        self.packed_head_bias = np.zeros((N_CLS_PADDED,), dtype=bfloat16)
-        self.packed_head_bias[:NUM_CLASSES] = head_bias.astype(bfloat16)
+        self.cpu_head_weight = self.model.head.weight.detach().cpu().float().numpy()
+        self.cpu_head_bias = self.model.head.bias.detach().cpu().float().numpy()
         self.zero_hidden = np.zeros((self.B, self.hidden_dim), dtype=bfloat16)
 
         ctx = AIEContext(use_runlist=False)
-        self.npu_op = StreamingResMLPLogits(
-            self.packed_weights_by_tile,
-            self.packed_head_weight,
-            self.packed_head_bias,
-            H=self.hidden_dim,
-            B=self.B,
-            num_cols=self.num_cols,
-            stream_depth=self.stream_depth,
-            context=ctx,
-        )
+        if self.npu_head:
+            packed_head_weight = np.asarray(
+                to_tiled(self.model.export_head_weight(padded_classes=N_CLS_PADDED)),
+                dtype=bfloat16,
+            )
+            packed_head_bias = np.zeros((N_CLS_PADDED,), dtype=bfloat16)
+            packed_head_bias[:NUM_CLASSES] = self.cpu_head_bias.astype(bfloat16)
+            self.npu_op = StreamingResMLPLogits(
+                self.packed_weights_by_tile,
+                packed_head_weight,
+                packed_head_bias,
+                H=self.hidden_dim,
+                B=self.B,
+                num_cols=self.num_cols,
+                stream_depth=self.stream_depth,
+                context=ctx,
+            )
+        else:
+            self.npu_op = StreamingResMLP(
+                self.packed_weights_by_tile,
+                H=self.hidden_dim,
+                B=self.B,
+                num_cols=self.num_cols,
+                stream_depth=self.stream_depth,
+                context=ctx,
+            )
         ctx.compile_all()
         ctx.prepare_runtime()
+
+    def _embed_images(self, images):
+        x_flat = images.view(self.B, -1).float()
+        x_hidden = (x_flat @ self.embed_weight.T + self.embed_bias).numpy()
+        return x_hidden.astype(bfloat16)
 
     def _pad_and_pack_hidden(self, hidden_batches):
         valid = len(hidden_batches)
@@ -94,18 +134,30 @@ class ResidualStreamingInferenceService:
         self.npu_op.write_buffer("input", packed_input)
         elapsed = self.npu_op.run_stream()
 
-        logits_flat = self.npu_op.read_buffer(
-            "output",
-            (self.stream_depth * self.B * N_CLS_PADDED,),
-            copy=True,
-        )
         outputs = []
-        for idx in range(valid):
-            start = idx * self.B * N_CLS_PADDED
-            stop = (idx + 1) * self.B * N_CLS_PADDED
-            outputs.append(
-                logits_flat[start:stop].reshape(self.B, N_CLS_PADDED)[:, :NUM_CLASSES].astype(np.float32)
+        if self.npu_head:
+            logits_flat = self.npu_op.read_buffer(
+                "output",
+                (self.stream_depth * self.B * N_CLS_PADDED,),
+                copy=True,
             )
+            for idx in range(valid):
+                start = idx * self.B * N_CLS_PADDED
+                stop = (idx + 1) * self.B * N_CLS_PADDED
+                outputs.append(
+                    logits_flat[start:stop].reshape(self.B, N_CLS_PADDED)[:, :NUM_CLASSES].astype(np.float32)
+                )
+        else:
+            hidden_flat = self.npu_op.read_buffer(
+                "output",
+                (self.stream_depth * self.B * self.hidden_dim,),
+                copy=True,
+            )
+            for idx in range(valid):
+                start = idx * self.B * self.hidden_dim
+                stop = (idx + 1) * self.B * self.hidden_dim
+                hidden = from_tiled(hidden_flat[start:stop], self.B, self.hidden_dim).astype(np.float32)
+                outputs.append(hidden @ self.cpu_head_weight.T + self.cpu_head_bias)
         return outputs, elapsed
 
     def process_hidden_stream(self, hidden_batch_iter):
@@ -129,12 +181,45 @@ class ResidualStreamingInferenceService:
         """Yield logits/preds for an arbitrary-length image batch iterator."""
         def hidden_iter():
             for images in image_batch_iter:
-                x_flat = images.view(self.B, -1).float()
-                x_hidden = (x_flat @ self.embed_weight.T + self.embed_bias).numpy()
-                yield x_hidden.astype(bfloat16)
+                yield self._embed_images(images)
 
         for logits in self.process_hidden_stream(iter(hidden_iter())):
             yield torch.from_numpy(logits)
+
+    def benchmark(self, repeated_images, num_images, warmup_calls=4):
+        if repeated_images.shape[0] != self.B:
+            raise ValueError(
+                f"Expected repeated_images batch dimension {self.B}, got {repeated_images.shape[0]}"
+            )
+
+        calls = math.ceil(num_images / (self.B * self.stream_depth))
+        processed_images = calls * self.B * self.stream_depth
+        repeated_images = repeated_images.contiguous()
+
+        for _ in range(warmup_calls):
+            hidden_batches = [self._embed_images(repeated_images) for _ in range(self.stream_depth)]
+            self.process_hidden_chunk(hidden_batches)
+
+        cpu_embed_s = 0.0
+        kernel_s = 0.0
+        t_wall0 = time.perf_counter()
+        for _ in range(calls):
+            t_cpu0 = time.perf_counter()
+            hidden_batches = [self._embed_images(repeated_images) for _ in range(self.stream_depth)]
+            cpu_embed_s += time.perf_counter() - t_cpu0
+            _, elapsed = self.process_hidden_chunk(hidden_batches)
+            kernel_s += elapsed
+        wall_s = time.perf_counter() - t_wall0
+
+        return {
+            "num_images_requested": num_images,
+            "num_images_processed": processed_images,
+            "wall_s": wall_s,
+            "cpu_embed_s": cpu_embed_s,
+            "kernel_s": kernel_s,
+            "wall_img_s": processed_images / wall_s,
+            "kernel_img_s": processed_images / kernel_s,
+        }
 
 
 def mnist_batch_iterator(dataset, batch_size):
@@ -155,6 +240,9 @@ def main():
     parser.add_argument("checkpoint", help="Path to trained .pt checkpoint")
     parser.add_argument("--hidden-dim", type=int, default=None)
     parser.add_argument("--num-layers", type=int, default=None)
+    parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--cpu-head", action="store_true",
+                        help="Use the body-only streamer and run the classifier head on the host")
     parser.add_argument("--num-cols", type=int, default=8)
     parser.add_argument(
         "--stream-depth",
@@ -163,7 +251,13 @@ def main():
         help="Microbatches per NPU call; validated up to 32 on the full H=160, 32-tile path",
     )
     parser.add_argument("--bench", action="store_true", help="Show timing")
+    parser.add_argument("--bench-images", type=int, default=None,
+                        help="Run a repeated-image throughput benchmark over this many images")
+    parser.add_argument("--eval-split", choices=["val", "test"], default=None)
+    parser.add_argument("--preview-samples", type=int, default=0)
+    parser.add_argument("--preview-out", type=str, default=None)
     parser.add_argument("--max-batches", type=int, default=None)
+    parser.add_argument("--data-dir", type=str, default="data")
     args = parser.parse_args()
 
     print(f"Loading {args.checkpoint}...")
@@ -172,28 +266,54 @@ def main():
         args.checkpoint,
         hidden_dim=args.hidden_dim,
         num_layers=args.num_layers,
+        batch_size=args.batch_size,
+        npu_head=not args.cpu_head,
         num_cols=args.num_cols,
         stream_depth=args.stream_depth,
     )
-    print(f"  pipeline={service.pipeline}, epoch={service.epoch}, test acc={service.test_acc}")
     print(
-        f"Compiled streaming NPU pipeline ({service.num_tiles} tiles, H={service.hidden_dim}, "
-        f"stream_depth={service.stream_depth}) in {time.time() - t0:.1f}s"
+        f"  pipeline={service.pipeline}, epoch={service.epoch}, "
+        f"saved {service.eval_split} acc={service.saved_eval_acc}"
+    )
+    print(
+        f"Compiled streaming NPU pipeline ({service.num_tiles} tiles, B={service.B}, H={service.hidden_dim}, "
+        f"stream_depth={service.stream_depth}, head={'npu' if service.npu_head else 'cpu'}) in {time.time() - t0:.1f}s"
     )
 
-    transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize((0.1307,), (0.3081,)),
-    ])
-    test_ds = datasets.MNIST("data", train=False, download=True, transform=transform)
+    eval_split = args.eval_split or service.eval_split
+    eval_ds = get_mnist_eval_dataset(
+        split=eval_split,
+        data_dir=args.data_dir,
+        val_size=service.val_size,
+        split_seed=service.split_seed,
+    )
+
+    if args.bench_images is not None:
+        repeated_images, _, _ = next(mnist_batch_iterator(eval_ds, service.B))
+        stats = service.benchmark(repeated_images, args.bench_images)
+        print("\nRepeated-image benchmark:")
+        for key in (
+            "num_images_requested",
+            "num_images_processed",
+            "wall_s",
+            "cpu_embed_s",
+            "kernel_s",
+            "wall_img_s",
+            "kernel_img_s",
+        ):
+            print(f"  {key}: {stats[key]}")
+        return 0
 
     correct = 0
     total = 0
     npu_time = 0.0
     npu_calls = 0
     cpu_time = 0.0
+    preview_images = []
+    preview_labels = []
+    preview_preds = []
 
-    batch_iter = mnist_batch_iterator(test_ds, service.B)
+    batch_iter = mnist_batch_iterator(eval_ds, service.B)
     consumed_batches = 0
     while True:
         batch_group = []
@@ -201,7 +321,8 @@ def main():
             while len(batch_group) < service.stream_depth:
                 if args.max_batches is not None and consumed_batches >= args.max_batches:
                     break
-                batch_group.append(next(batch_iter))
+                images, labels, actual_b = next(batch_iter)
+                batch_group.append((images, labels, actual_b))
                 consumed_batches += 1
         except StopIteration:
             pass
@@ -210,28 +331,45 @@ def main():
             break
 
         hidden_batches = []
-        labels_meta = []
+        batch_meta = []
         t_cpu0 = time.perf_counter()
         for images, labels, actual_b in batch_group:
-            x_flat = images.view(service.B, -1).float()
-            x_hidden = (x_flat @ service.embed_weight.T + service.embed_bias).numpy()
-            hidden_batches.append(x_hidden.astype(bfloat16))
-            labels_meta.append((labels, actual_b))
+            hidden_batches.append(service._embed_images(images))
+            batch_meta.append((images, labels, actual_b))
         cpu_time += time.perf_counter() - t_cpu0
 
         outputs, elapsed = service.process_hidden_chunk(hidden_batches)
         npu_time += elapsed
         npu_calls += 1
 
-        for logits_np, (labels, actual_b) in zip(outputs, labels_meta):
+        for logits_np, (images, labels, actual_b) in zip(outputs, batch_meta):
             logits = torch.from_numpy(logits_np)
             preds = logits[:actual_b].argmax(1)
             correct += (preds == labels).sum().item()
             total += actual_b
+            remaining = args.preview_samples - len(preview_labels)
+            if remaining > 0:
+                take = min(remaining, actual_b)
+                preview_images.append(images[:take].clone())
+                preview_labels.extend(labels[:take].tolist())
+                preview_preds.extend(preds[:take].tolist())
 
     accuracy = correct / total if total else 0.0
     print(f"\n{'═' * 50}")
-    print(f"Streaming NPU accuracy: {accuracy:.4f} ({correct}/{total})")
+    print(f"Streaming NPU {eval_split} accuracy: {accuracy:.4f} ({correct}/{total})")
+
+    preview_out = args.preview_out
+    if args.preview_samples > 0 and preview_out is None:
+        preview_out = str(Path("build") / f"streaming_{eval_split}_preview_h{service.hidden_dim}_b{service.B}.png")
+    if preview_out is not None and preview_labels:
+        preview_path = save_prediction_preview(
+            torch.cat(preview_images, dim=0),
+            preview_labels,
+            preview_preds,
+            preview_out,
+            max_items=args.preview_samples,
+        )
+        print(f"Preview: {preview_path}")
 
     if args.bench and npu_calls:
         print("\nTiming:")

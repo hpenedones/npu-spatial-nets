@@ -33,6 +33,12 @@ def _load_embedded_weights(weights_path: str | Path, num_tiles: int, H: int):
     }
 
 
+def _tail_stack_size_bytes(B: int, H: int) -> int:
+    scratch_bytes = 2 * B * H + 4 * B * N_CLS_PADDED
+    stack_bytes = max(0x1000, scratch_bytes)
+    return ((stack_bytes + 0x7FF) // 0x800) * 0x800
+
+
 def snake_streaming_logits_pipeline(
     H=160,
     B=8,
@@ -145,7 +151,7 @@ def snake_streaming_logits_pipeline(
             ],
             placement=Tile(col=tail_col, row=tail_row),
             allocation_scheme="basic-sequential",
-            stack_size=0x1000,
+            stack_size=_tail_stack_size_bytes(B, H),
         )
     )
 

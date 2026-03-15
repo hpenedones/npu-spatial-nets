@@ -17,26 +17,13 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader
-from torchvision import datasets, transforms
 
+from resmlp.mnist_utils import (
+    DEFAULT_SPLIT_SEED,
+    DEFAULT_VAL_SIZE,
+    get_mnist_dataloaders,
+)
 from resmlp.model import ResMLP
-
-
-def get_dataloaders(batch_size=128, data_dir="data"):
-    """Standard MNIST train/test loaders."""
-    transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize((0.1307,), (0.3081,)),
-    ])
-    train_ds = datasets.MNIST(data_dir, train=True, download=True,
-                              transform=transform)
-    test_ds = datasets.MNIST(data_dir, train=False, transform=transform)
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
-                              num_workers=2, pin_memory=True)
-    test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False,
-                             num_workers=2)
-    return train_loader, test_loader
 
 
 def train_epoch(model, loader, optimizer, criterion, device):
@@ -69,6 +56,28 @@ def evaluate(model, loader, criterion, device):
     return total_loss / total, correct / total
 
 
+def build_checkpoint(args, epoch, model, optimizer, eval_name, eval_loss, eval_acc):
+    checkpoint = {
+        "epoch": epoch,
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "pipeline": "hybrid",
+        "hidden_dim": args.hidden_dim,
+        "num_layers": args.num_layers,
+        "eval_split": eval_name,
+        "val_size": args.val_size,
+        "split_seed": args.split_seed,
+        "npu_batch_size": args.batch_size,
+    }
+    if eval_name == "val":
+        checkpoint["val_loss"] = eval_loss
+        checkpoint["val_acc"] = eval_acc
+    else:
+        checkpoint["test_loss"] = eval_loss
+        checkpoint["test_acc"] = eval_acc
+    return checkpoint
+
+
 def main():
     parser = argparse.ArgumentParser(description="Train ResMLP on MNIST")
     parser.add_argument("--epochs", type=int, default=10)
@@ -76,6 +85,9 @@ def main():
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--hidden-dim", type=int, default=160)
     parser.add_argument("--num-layers", type=int, default=32)
+    parser.add_argument("--data-dir", type=str, default="data")
+    parser.add_argument("--val-size", type=int, default=DEFAULT_VAL_SIZE)
+    parser.add_argument("--split-seed", type=int, default=DEFAULT_SPLIT_SEED)
     parser.add_argument("--resume", type=str, default=None)
     parser.add_argument("--save-dir", type=str, default="resmlp/checkpoints")
     args = parser.parse_args()
@@ -103,11 +115,20 @@ def main():
         start_epoch = ckpt["epoch"] + 1
         print(f"Resumed from epoch {start_epoch}")
 
-    # Data
-    train_loader, test_loader = get_dataloaders(args.batch_size)
+    train_loader, val_loader, test_loader = get_mnist_dataloaders(
+        args.batch_size,
+        data_dir=args.data_dir,
+        val_size=args.val_size,
+        split_seed=args.split_seed,
+    )
+    eval_loader = val_loader if val_loader is not None else test_loader
+    eval_name = "val" if val_loader is not None else "test"
+    print(f"Data split: train={len(train_loader.dataset):,}, {eval_name}={len(eval_loader.dataset):,}")
 
     save_dir = Path(args.save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
+    best_eval_acc = float("-inf")
+    best_path = save_dir / "resmlp_best.pt"
 
     # Train
     print(f"\nTraining for {args.epochs} epochs...")
@@ -116,26 +137,29 @@ def main():
         train_loss, train_acc = train_epoch(
             model, train_loader, optimizer, criterion, device
         )
-        test_loss, test_acc = evaluate(model, test_loader, criterion, device)
+        eval_loss, eval_acc = evaluate(model, eval_loader, criterion, device)
         elapsed = time.time() - t0
 
         print(f"  Epoch {epoch:3d}: "
               f"train loss={train_loss:.4f} acc={train_acc:.4f} | "
-              f"test loss={test_loss:.4f} acc={test_acc:.4f} | "
+              f"{eval_name} loss={eval_loss:.4f} acc={eval_acc:.4f} | "
               f"{elapsed:.1f}s")
+
+        checkpoint = build_checkpoint(
+            args, epoch, model, optimizer, eval_name, eval_loss, eval_acc
+        )
+        if eval_acc > best_eval_acc:
+            best_eval_acc = eval_acc
+            torch.save(checkpoint, best_path)
+            print(f"    → saved {best_path} (best {eval_name})")
 
         # Save checkpoint every 5 epochs and at the end
         if (epoch + 1) % 5 == 0 or epoch == start_epoch + args.epochs - 1:
             path = save_dir / f"resmlp_epoch{epoch:03d}.pt"
-            torch.save({
-                "epoch": epoch,
-                "model": model.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "test_acc": test_acc,
-            }, path)
+            torch.save(checkpoint, path)
             print(f"    → saved {path}")
 
-    print(f"\nFinal test accuracy: {test_acc:.4f}")
+    print(f"\nFinal {eval_name} accuracy: {eval_acc:.4f}")
     return 0
 
 
