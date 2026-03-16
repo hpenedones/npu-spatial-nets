@@ -35,6 +35,7 @@ class StreamingResMLPLogits(AIEOperatorBase):
         B=8,
         num_cols=8,
         stream_depth=32,
+        n_cls_padded=N_CLS_PADDED,
         context=None,
     ):
         self.H = H
@@ -42,6 +43,7 @@ class StreamingResMLPLogits(AIEOperatorBase):
         self.num_cols = num_cols
         self.num_tiles = num_cols * ROWS_PER_COL
         self.stream_depth = stream_depth
+        self.n_cls_padded = n_cls_padded
         self._insts_synced = False
 
         packed_weights_by_tile = np.asarray(packed_weights_by_tile)
@@ -52,15 +54,15 @@ class StreamingResMLPLogits(AIEOperatorBase):
             )
 
         packed_head_weight = np.asarray(packed_head_weight)
-        if packed_head_weight.shape != (H * N_CLS_PADDED,):
+        if packed_head_weight.shape != (H * self.n_cls_padded,):
             raise ValueError(
-                f"Expected packed_head_weight shape {(H * N_CLS_PADDED,)}, got {packed_head_weight.shape}"
+                f"Expected packed_head_weight shape {(H * self.n_cls_padded,)}, got {packed_head_weight.shape}"
             )
 
         packed_head_bias = np.asarray(packed_head_bias)
-        if packed_head_bias.shape != (N_CLS_PADDED,):
+        if packed_head_bias.shape != (self.n_cls_padded,):
             raise ValueError(
-                f"Expected packed_head_bias shape {(N_CLS_PADDED,)}, got {packed_head_bias.shape}"
+                f"Expected packed_head_bias shape {(self.n_cls_padded,)}, got {packed_head_bias.shape}"
             )
 
         self.packed_weights_by_tile = packed_weights_by_tile
@@ -79,7 +81,7 @@ class StreamingResMLPLogits(AIEOperatorBase):
         build_dir = Path(__file__).resolve().parent.parent / "build"
         build_dir.mkdir(parents=True, exist_ok=True)
         path = build_dir / (
-            f"resmlp_streaming_logits_weights_{self.num_tiles}t_h{self.H}_{self.weight_tag}.npz"
+            f"resmlp_streaming_logits_weights_{self.num_tiles}t_h{self.H}_c{self.n_cls_padded}_{self.weight_tag}.npz"
         )
         if not path.exists():
             np.savez(
@@ -107,11 +109,11 @@ class StreamingResMLPLogits(AIEOperatorBase):
             kernels_dir / "residual_head_infer.cc",
             self.weights_path,
         )
-        kernel_tag = f"b{B}_h{H}_{kernel_fp}"
+        kernel_tag = f"b{B}_h{H}_c{self.n_cls_padded}_{kernel_fp}"
         archive_name = f"{prefix}kernel_{kernel_tag}.a"
 
         mlir_artifact = PythonGeneratedMLIRArtifact.new(
-            f"{prefix}{B}x{H}_{self.num_cols}col_s{self.stream_depth}_{self.weight_tag}_{build_fp}.mlir",
+            f"{prefix}{B}x{H}x{self.n_cls_padded}_{self.num_cols}col_s{self.stream_depth}_{self.weight_tag}_{build_fp}.mlir",
             import_path=operator_dir / "streaming_logits_design.py",
             callback_fn="snake_streaming_logits_pipeline",
             callback_kwargs={
@@ -121,6 +123,7 @@ class StreamingResMLPLogits(AIEOperatorBase):
                 "stream_depth": self.stream_depth,
                 "archive_name": archive_name,
                 "weights_path": str(self.weights_path),
+                "n_cls_padded": self.n_cls_padded,
             },
             requires_context=False,
         )
@@ -134,12 +137,12 @@ class StreamingResMLPLogits(AIEOperatorBase):
         tail_flags = [
             f"-DDIM_M={B}",
             f"-DDIM_H={H}",
-            f"-DDIM_N_CLS={N_CLS_PADDED}",
+            f"-DDIM_N_CLS={self.n_cls_padded}",
             "-DAIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16",
         ]
 
         xclbin_artifact = XclbinArtifact.new(
-            f"{prefix}{B}x{H}_{self.num_cols}col_s{self.stream_depth}_{self.weight_tag}_{build_fp}.xclbin",
+            f"{prefix}{B}x{H}x{self.n_cls_padded}_{self.num_cols}col_s{self.stream_depth}_{self.weight_tag}_{build_fp}.xclbin",
             depends=[
                 mlir_artifact,
                 KernelArchiveArtifact.new(
@@ -165,7 +168,7 @@ class StreamingResMLPLogits(AIEOperatorBase):
         )
 
         insts_artifact = InstsBinArtifact.new(
-            f"{prefix}{B}x{H}_{self.num_cols}col_s{self.stream_depth}_{self.weight_tag}_{build_fp}.bin",
+            f"{prefix}{B}x{H}x{self.n_cls_padded}_{self.num_cols}col_s{self.stream_depth}_{self.weight_tag}_{build_fp}.bin",
             depends=[mlir_artifact],
         )
         return xclbin_artifact, insts_artifact
@@ -184,7 +187,7 @@ class StreamingResMLPLogits(AIEOperatorBase):
             self.insts_artifact,
         )
         self.add_buffer("input", self.stream_depth * self.B * self.H)
-        self.add_buffer("output", self.stream_depth * self.B * N_CLS_PADDED)
+        self.add_buffer("output", self.stream_depth * self.B * self.n_cls_padded)
 
     def _run_args(self):
         return (

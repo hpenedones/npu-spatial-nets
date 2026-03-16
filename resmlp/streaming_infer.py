@@ -24,7 +24,7 @@ from resmlp.data_utils import (
 )
 from resmlp.model import ResMLP
 from resmlp.design import ROWS_PER_COL
-from resmlp.streaming_logits_design import N_CLS_PADDED, NUM_CLASSES
+from resmlp.streaming_logits_design import padded_class_dim
 from resmlp.streaming_logits_op import StreamingResMLPLogits
 from resmlp.streaming_op import StreamingResMLP
 
@@ -56,6 +56,7 @@ class ResidualStreamingInferenceService:
         self.num_layers = num_layers if num_layers is not None else ckpt.get("num_layers", 32)
         self.input_dim = ckpt.get("input_dim", dataset_cfg["input_dim"])
         self.num_classes = ckpt.get("num_classes", dataset_cfg["num_classes"])
+        self.n_cls_padded = padded_class_dim(self.num_classes)
         self.residual_bias = bool(ckpt.get("residual_bias", False))
         self.pipeline = ckpt.get("pipeline", "hybrid")
         self.epoch = ckpt["epoch"]
@@ -106,17 +107,12 @@ class ResidualStreamingInferenceService:
 
         ctx = AIEContext(use_runlist=False)
         if self.npu_head:
-            if self.num_classes != NUM_CLASSES:
-                raise ValueError(
-                    f"NPU logits head currently supports {NUM_CLASSES} classes, "
-                    f"but checkpoint uses {self.num_classes}; retry with --cpu-head"
-                )
             packed_head_weight = np.asarray(
-                to_tiled(self.model.export_head_weight(padded_classes=N_CLS_PADDED)),
+                to_tiled(self.model.export_head_weight(padded_classes=self.n_cls_padded)),
                 dtype=bfloat16,
             )
-            packed_head_bias = np.zeros((N_CLS_PADDED,), dtype=bfloat16)
-            packed_head_bias[:NUM_CLASSES] = self.cpu_head_bias.astype(bfloat16)
+            packed_head_bias = np.zeros((self.n_cls_padded,), dtype=bfloat16)
+            packed_head_bias[: self.num_classes] = self.cpu_head_bias.astype(bfloat16)
             self.npu_op = StreamingResMLPLogits(
                 self.packed_weights_by_tile,
                 packed_head_weight,
@@ -125,6 +121,7 @@ class ResidualStreamingInferenceService:
                 B=self.B,
                 num_cols=self.num_cols,
                 stream_depth=self.stream_depth,
+                n_cls_padded=self.n_cls_padded,
                 context=ctx,
             )
         else:
@@ -163,16 +160,18 @@ class ResidualStreamingInferenceService:
         if self.npu_head:
             logits_flat = self.npu_op.read_buffer(
                 "output",
-                (self.stream_depth * self.B * N_CLS_PADDED,),
+                (self.stream_depth * self.B * self.n_cls_padded,),
                 copy=True,
             )
             for idx in range(valid):
-                start = idx * self.B * N_CLS_PADDED
-                stop = (idx + 1) * self.B * N_CLS_PADDED
+                start = idx * self.B * self.n_cls_padded
+                stop = (idx + 1) * self.B * self.n_cls_padded
                 outputs.append(
-                    logits_flat[start:stop]
-                    .reshape(self.B, N_CLS_PADDED)[:, : self.num_classes]
-                    .astype(np.float32)
+                    from_tiled(
+                        logits_flat[start:stop],
+                        self.B,
+                        self.n_cls_padded,
+                    ).astype(np.float32)[:, : self.num_classes]
                 )
         else:
             hidden_flat = self.npu_op.read_buffer(

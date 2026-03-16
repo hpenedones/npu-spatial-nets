@@ -1355,10 +1355,8 @@ $H=32$, $L=8$ & 71.76\% & 71.81\% \\
 $H=32$, $L=32$ & 72.04\% & 72.03\% \\
 \bottomrule
 \end{tabular}
-\caption{Real HIGGS pilot on the public \code{jxie/higgs} mirror. The residual
-body runs in the streamed NPU path; the final $32 \to 2$ classifier head still
-runs on the host because the current logits kernel is fixed to the 10-class
-image path.}
+\caption{Real HIGGS pilot on the public \code{jxie/higgs} mirror. The streamed
+residual path already reproduces the CPU reference closely on real public data.}
 \label{tab:higgs-real-pilot}
 \end{table}
 
@@ -1368,8 +1366,41 @@ that the HIGGS demo is no longer just a synthetic-throughput toy: the smallest
 far, lands within about one percentage point of the strongest tuned
 \code{higgs\_small} baselines in Table~\ref{tab:higgs-small-rtdl}. Just as
 importantly, the streamed NPU body reproduces the CPU reference to within
-measurement noise, so the deployment path is numerically credible even though
-the 2-class head has not yet moved on-array.
+measurement noise, so the deployment path is numerically credible.
+
+Once that real-data check passed, the next obvious question was whether the tiny
+$32 \to 2$ classifier head should also move on-array. The answer is
+counterintuitive but important for the throughput story: not yet. A fused
+2-class NPU head now works and keeps accuracy intact, but on the current tail
+kernel it actually reduces throughput compared with leaving that tiny head on
+the host.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}llrr@{}}
+\toprule
+Configuration & Head placement & Wall throughput & Kernel throughput \\
+\midrule
+$H=32$, $L=8$, 2 columns & CPU head & 4.18M samples/s & 26.29M samples/s \\
+$H=32$, $L=8$, 2 columns & NPU head & 3.65M samples/s & 7.47M samples/s \\
+$H=32$, $L=32$, 8 columns & CPU head & 3.49M samples/s & 19.06M samples/s \\
+$H=32$, $L=32$, 8 columns & NPU head & 3.15M samples/s & 6.68M samples/s \\
+\bottomrule
+\end{tabular}
+\caption{Repeated-image throughput on the real HIGGS checkpoints over 50M
+processed samples. The throughput winner remains the 8-layer, 2-column path
+with the classifier head left on CPU.}
+\label{tab:higgs-real-throughput}
+\end{table}
+
+That table sharpens the systems conclusion. For this HIGGS-sized model, the
+classifier head is not the wall-clock bottleneck; the current fused tail kernel
+is slower than a host-side $32 \to 2$ matmul, so moving the head on-array does
+not improve the main result. The best current point therefore remains the
+throughput-oriented 8-layer configuration at about 4.18M samples/s wall-clock,
+and the higher-leverage next step is still to move the $56 \to 32$ embed path
+on-array rather than insist on the present fused-head design.
 
 \section{Compact glossary}
 

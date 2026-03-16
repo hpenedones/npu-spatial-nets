@@ -122,23 +122,6 @@ residual_add(const bfloat16 *__restrict a, bfloat16 *__restrict c)
     }
 }
 
-static inline void
-untile_to_row_major(const bfloat16 *tiled, bfloat16 *row_major, int M, int N)
-{
-    constexpr int br = 8, bc = 8;
-    for (int bi = 0; bi < M / br; ++bi) {
-        for (int bj = 0; bj < N / bc; ++bj) {
-            for (int r = 0; r < br; ++r) {
-                for (int c = 0; c < bc; ++c) {
-                    int tiled_idx = (bi * (N / bc) + bj) * br * bc + r * bc + c;
-                    int rm_idx = (bi * br + r) * N + (bj * bc + c);
-                    row_major[rm_idx] = tiled[tiled_idx];
-                }
-            }
-        }
-    }
-}
-
 extern "C" {
 
 void residual_head_infer_bf16(
@@ -153,20 +136,24 @@ void residual_head_infer_bf16(
     static_assert(DIM_N_CLS % 8 == 0, "Class dim must be multiple of 8");
 
     alignas(32) bfloat16 hidden[DIM_M * DIM_H];
-    alignas(32) bfloat16 logits_tiled[DIM_M * DIM_N_CLS];
-    alignas(32) bfloat16 logits_row_major[DIM_M * DIM_N_CLS];
 
     matmul_relu<bfloat16, (DIM_M / 8), (DIM_H / 8), (DIM_H / 8), false>(a, w_res, hidden);
     residual_add(a, hidden);
 
     matmul_plain<bfloat16, (DIM_M / 8), (DIM_H / 8), (DIM_N_CLS / 8)>(
-        hidden, w_head, logits_tiled);
-    untile_to_row_major(logits_tiled, logits_row_major, DIM_M, DIM_N_CLS);
+        hidden, w_head, logits_out);
 
-    for (int b = 0; b < DIM_M; ++b) {
-        for (int c = 0; c < DIM_N_CLS; ++c) {
-            int idx = b * DIM_N_CLS + c;
-            logits_out[idx] = (bfloat16)((float)logits_row_major[idx] + (float)b_head[c]);
+    constexpr int br = 8, bc = 8;
+    for (int bi = 0; bi < DIM_M / br; ++bi) {
+        for (int bj = 0; bj < DIM_N_CLS / bc; ++bj) {
+            bfloat16 *block = logits_out + (bi * (DIM_N_CLS / bc) + bj) * br * bc;
+            bfloat16 *bias_block = b_head + bj * bc;
+            for (int r = 0; r < br; ++r) {
+                for (int c = 0; c < bc; ++c) {
+                    int idx = r * bc + c;
+                    block[idx] = (bfloat16)((float)block[idx] + (float)bias_block[c]);
+                }
+            }
         }
     }
 }

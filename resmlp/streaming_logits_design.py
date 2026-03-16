@@ -17,6 +17,12 @@ NUM_CLASSES = 10
 N_CLS_PADDED = 16
 
 
+def padded_class_dim(num_classes: int) -> int:
+    if num_classes < 1:
+        raise ValueError(f"num_classes must be positive, got {num_classes}")
+    return ((num_classes + 7) // 8) * 8
+
+
 def _restore_bfloat16(array, shape):
     raw = np.asarray(array)
     if raw.itemsize != 2:
@@ -24,17 +30,17 @@ def _restore_bfloat16(array, shape):
     return raw.view(bfloat16).reshape(shape)
 
 
-def _load_embedded_weights(weights_path: str | Path, num_tiles: int, H: int):
+def _load_embedded_weights(weights_path: str | Path, num_tiles: int, H: int, n_cls_padded: int):
     data = np.load(Path(weights_path), allow_pickle=False)
     return {
         "residual": _restore_bfloat16(data["residual"], (num_tiles, H * H)),
-        "head_weight": _restore_bfloat16(data["head_weight"], (H * N_CLS_PADDED,)),
-        "head_bias": _restore_bfloat16(data["head_bias"], (N_CLS_PADDED,)),
+        "head_weight": _restore_bfloat16(data["head_weight"], (H * n_cls_padded,)),
+        "head_bias": _restore_bfloat16(data["head_bias"], (n_cls_padded,)),
     }
 
 
-def _tail_stack_size_bytes(B: int, H: int) -> int:
-    scratch_bytes = 2 * B * H + 4 * B * N_CLS_PADDED
+def _tail_stack_size_bytes(B: int, H: int, n_cls_padded: int) -> int:
+    scratch_bytes = 2 * B * H + 4 * B * n_cls_padded
     # The tail kernel keeps several tile-local scratch buffers on the worker
     # stack. Budgeting only the raw array footprint is too tight once the
     # compiler adds its own frame temporaries, which shows up as all-NaN logits
@@ -50,25 +56,27 @@ def snake_streaming_logits_pipeline(
     stream_depth=32,
     archive_name="resmlp_streaming_logits_kernel.a",
     weights_path=None,
+    n_cls_padded=N_CLS_PADDED,
 ):
     assert 1 <= num_cols <= 8
     assert B % 8 == 0 and H % 8 == 0
     assert stream_depth >= 1
+    assert n_cls_padded % 8 == 0
     if weights_path is None:
         raise ValueError("weights_path is required for embedded-weight streaming inference")
 
     num_tiles = num_cols * ROWS_PER_COL
-    packed = _load_embedded_weights(weights_path, num_tiles=num_tiles, H=H)
+    packed = _load_embedded_weights(weights_path, num_tiles=num_tiles, H=H, n_cls_padded=n_cls_padded)
     tile_order = snake_tile_order(num_cols)
     fifo_depth = 1 if stream_depth == 1 else 2
 
     act_ty = np.ndarray[(B * H,), np.dtype[bfloat16]]
     res_wt_ty = np.ndarray[(H * H,), np.dtype[bfloat16]]
-    head_wt_ty = np.ndarray[(H * N_CLS_PADDED,), np.dtype[bfloat16]]
-    head_bias_ty = np.ndarray[(N_CLS_PADDED,), np.dtype[bfloat16]]
-    logits_ty = np.ndarray[(B * N_CLS_PADDED,), np.dtype[bfloat16]]
+    head_wt_ty = np.ndarray[(H * n_cls_padded,), np.dtype[bfloat16]]
+    head_bias_ty = np.ndarray[(n_cls_padded,), np.dtype[bfloat16]]
+    logits_ty = np.ndarray[(B * n_cls_padded,), np.dtype[bfloat16]]
     host_in_ty = np.ndarray[(stream_depth, B, H), np.dtype[bfloat16]]
-    host_out_ty = np.ndarray[(stream_depth, B, N_CLS_PADDED), np.dtype[bfloat16]]
+    host_out_ty = np.ndarray[(stream_depth, B, n_cls_padded), np.dtype[bfloat16]]
 
     res_kernel = Kernel(
         "matmul_relu_skip_infer_bf16",
@@ -155,7 +163,7 @@ def snake_streaming_logits_pipeline(
             ],
             placement=Tile(col=tail_col, row=tail_row),
             allocation_scheme="basic-sequential",
-            stack_size=_tail_stack_size_bytes(B, H),
+            stack_size=_tail_stack_size_bytes(B, H, n_cls_padded),
         )
     )
 
@@ -166,10 +174,10 @@ def snake_streaming_logits_pipeline(
         [B * H, 0, H, 1],
     )
     out_tap = TensorAccessPattern(
-        (stream_depth, B, N_CLS_PADDED),
+        (stream_depth, B, n_cls_padded),
         0,
-        [stream_depth, 1, B, N_CLS_PADDED],
-        [B * N_CLS_PADDED, 0, N_CLS_PADDED, 1],
+        [stream_depth, 1, B, n_cls_padded],
+        [B * n_cls_padded, 0, n_cls_padded, 1],
     )
 
     rt = Runtime()
@@ -192,6 +200,7 @@ if __name__ == "__main__":
     p.add_argument("--B", type=int, default=8)
     p.add_argument("--cols", type=int, default=8)
     p.add_argument("--stream-depth", type=int, default=32)
+    p.add_argument("--n-cls-padded", type=int, default=N_CLS_PADDED)
     p.add_argument("--weights-path", required=True)
     p.add_argument("-o", "--output", default="build/resmlp_streaming_logits.mlir")
     args = p.parse_args()
@@ -202,6 +211,7 @@ if __name__ == "__main__":
         num_cols=args.cols,
         stream_depth=args.stream_depth,
         weights_path=args.weights_path,
+        n_cls_padded=args.n_cls_padded,
     )
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     Path(args.output).write_text(str(module))
