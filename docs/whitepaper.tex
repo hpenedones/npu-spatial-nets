@@ -1378,6 +1378,50 @@ essentially unchanged: the $L=8$ checkpoint moves from ROC/PR AUC
 $0.7946/0.8099$ on CPU to $0.7947/0.8100$ on the NPU-head path, and the $L=32$
 checkpoint moves from $0.7956/0.8074$ to $0.7956/0.8075$.
 
+The small-split pilot answered the credibility question, but it still left a
+more ambitious one open: does the same throughput-friendly residual MLP get
+materially better once it is trained on the full public HIGGS data? To check
+that, I rebuilt the local cache directly from the published \code{train} and
+\code{test} parquet splits of the same \code{jxie/higgs} mirror, which yields
+10.5M training examples and a fixed 500k-example test set. For model selection
+I held out 100k examples from the training split, leaving 10.4M examples for
+optimization. The first full-data run kept the same $H=32$, $L=8$ model and
+the same AdamW-plus-cosine recipe, but increased batch size to 8192 and
+trained for only 5 epochs on the AMD Radeon 890M ROCm path. Even with the full
+100k validation pass every epoch, training took only about 27.8s/epoch, or
+roughly 374k training samples/s wall-clock. I then repeated the same 5-epoch
+recipe with the deeper $H=32$, $L=32$ model; that run took about 36.2s/epoch,
+still only about 1.3$\times$ slower than the 8-layer point.
+
+\begin{table}[h]
+\centering
+\footnotesize
+\begin{tabular}{@{}lcccc@{}}
+\toprule
+Model & Test acc. & ROC AUC & PR AUC & Log loss \\
+\midrule
+$H=32$, $L=8$ full-data & 75.89\% & 0.8430 & 0.8559 & 0.4861 \\
+$H=32$, $L=32$ full-data & 76.56\% & 0.8502 & 0.8628 & 0.4762 \\
+\bottomrule
+\end{tabular}
+\caption{Full-data HIGGS results on the public \code{jxie/higgs} mirror. The
+local cache uses the full published train/test splits (10.5M/500k rows);
+training holds out 100k examples for validation and fits on the remaining
+10.4M examples for 5 epochs with the same AdamW/cosine recipe.}
+\label{tab:higgs-full-first}
+\end{table}
+
+Those full-data results materially strengthen the HIGGS story. The same minimal
+8-layer model that previously landed near 0.795 ROC AUC on the smaller public
+pilot now reaches 0.843 ROC AUC and 75.89\% accuracy on the fixed
+500k-example test set once it sees the full public training pool. The deeper
+32-layer model improves that further to 0.850 ROC AUC and 76.56\% accuracy,
+buying about 0.67 percentage points of test accuracy and roughly 0.007 ROC AUC
+for only a modest increase in epoch time. These are still not tuned
+state-of-the-art tabular numbers, but they are clearly no longer just
+synthetic-throughput props either: the resident-snake operating points remain
+genuine large-tabular classifiers once the data scale becomes realistic.
+
 Once that real-data check passed, the next obvious question was whether the tiny
 $32 \to 2$ classifier head should also move on-array. The answer is
 counterintuitive but important for the throughput story: not yet. A fused
@@ -1409,7 +1453,7 @@ classifier head is not the wall-clock bottleneck; the current fused tail kernel
 is slower than a host-side $32 \to 2$ matmul, so moving the head on-array does
 not improve the main result. The best current point therefore remains the
 throughput-oriented 8-layer configuration at about 4.18M samples/s wall-clock,
-and the higher-leverage next step is still to move the $56 \to 32$ embed path
+and the higher-leverage next step is still to move the $28 \to 32$ embed path
 on-array rather than insist on the present fused-head design.
 
 \section{Compact glossary}

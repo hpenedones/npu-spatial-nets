@@ -647,6 +647,12 @@ def main():
             f"Checkpoint/input metadata ({input_dim} inputs, {num_classes} classes) "
             f"does not match dataset '{dataset_name}'"
         )
+    if args.pipeline == "full-npu" and input_dim % 8 != 0:
+        raise ValueError(
+            f"Full-NPU training requires an input dimension divisible by 8, got {input_dim}. "
+            "HIGGS now uses its native 28-dimensional input on the host path, so the full-NPU "
+            "embed path needs dedicated kernel work before it can support that dataset."
+        )
     if residual_bias:
         raise ValueError(
             "train_npu.py does not support residual-bias checkpoints yet because the current NPU "

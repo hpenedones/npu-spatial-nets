@@ -12,8 +12,7 @@ from torchvision import datasets, transforms
 
 DEFAULT_VAL_SIZE = 10_000
 DEFAULT_SPLIT_SEED = 1234
-HIGGS_PADDED_INPUT_DIM = 56
-HIGGS_RAW_INPUT_DIM = 28
+HIGGS_INPUT_DIM = 28
 HIGGS_TEST_FRACTION = 0.1
 
 DATASET_CONFIGS = {
@@ -37,8 +36,7 @@ DATASET_CONFIGS = {
     },
     "higgs": {
         "kind": "tabular",
-        "input_dim": HIGGS_PADDED_INPUT_DIM,
-        "raw_input_dim": HIGGS_RAW_INPUT_DIM,
+        "input_dim": HIGGS_INPUT_DIM,
         "num_classes": 2,
         "test_fraction": HIGGS_TEST_FRACTION,
     },
@@ -81,15 +79,11 @@ def _prepare_higgs_tensors(features, labels):
     labels = torch.as_tensor(labels, dtype=torch.long)
     if features.ndim != 2:
         raise ValueError(f"HIGGS features must be 2D, got shape {tuple(features.shape)}")
-    if features.shape[1] not in {HIGGS_RAW_INPUT_DIM, HIGGS_PADDED_INPUT_DIM}:
+    if features.shape[1] != HIGGS_INPUT_DIM:
         raise ValueError(
-            f"HIGGS features must have {HIGGS_RAW_INPUT_DIM} or {HIGGS_PADDED_INPUT_DIM} columns, "
+            f"HIGGS features must have {HIGGS_INPUT_DIM} columns, "
             f"got {features.shape[1]}"
         )
-    if features.shape[1] == HIGGS_RAW_INPUT_DIM:
-        padded = torch.zeros(features.shape[0], HIGGS_PADDED_INPUT_DIM, dtype=torch.float32)
-        padded[:, :HIGGS_RAW_INPUT_DIM] = features
-        features = padded
     labels = labels.view(-1)
     if labels.shape[0] != features.shape[0]:
         raise ValueError("HIGGS labels/features row count mismatch")
@@ -134,13 +128,13 @@ def _load_higgs_cache(data_dir="data"):
     opener = gzip.open if raw_path.suffix == ".gz" else open
     with opener(raw_path, "rt") as handle:
         table = np.loadtxt(handle, delimiter=",", dtype=np.float32)
-    if table.ndim != 2 or table.shape[1] < 1 + HIGGS_RAW_INPUT_DIM:
+    if table.ndim != 2 or table.shape[1] < 1 + HIGGS_INPUT_DIM:
         raise ValueError(
-            f"HIGGS raw file must have at least {1 + HIGGS_RAW_INPUT_DIM} columns, got shape {table.shape}"
+            f"HIGGS raw file must have at least {1 + HIGGS_INPUT_DIM} columns, got shape {table.shape}"
         )
 
     labels = table[:, 0].astype(np.int64, copy=False)
-    features = table[:, 1 : 1 + HIGGS_RAW_INPUT_DIM]
+    features = table[:, 1 : 1 + HIGGS_INPUT_DIM]
     features_t, labels_t = _prepare_higgs_tensors(features, labels)
     torch.save({"features": features_t, "labels": labels_t}, data_dir / "HIGGS.pt")
     return {"features": features_t, "labels": labels_t}
