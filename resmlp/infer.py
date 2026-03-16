@@ -62,6 +62,7 @@ def main():
     num_layers = args.num_layers if args.num_layers is not None else ckpt.get("num_layers", 32)
     input_dim = ckpt.get("input_dim", dataset_cfg["input_dim"])
     num_classes = ckpt.get("num_classes", dataset_cfg["num_classes"])
+    residual_bias = bool(ckpt.get("residual_bias", False))
     pipeline = ckpt.get("pipeline", "hybrid")
     eval_split = args.eval_split or ckpt.get("eval_split", "test")
     val_size = ckpt.get("val_size", DEFAULT_VAL_SIZE)
@@ -77,12 +78,18 @@ def main():
             "inference pipeline can only handle models with either all tiles "
             "used as residual layers or with 2 identity-padded endpoints."
         )
+    if residual_bias:
+        raise ValueError(
+            "NPU residual inference does not support residual-bias checkpoints yet. "
+            "Train/evaluate them on CPU/GPU first or add residual-bias support to the NPU kernels."
+        )
 
     model = ResMLP(
         hidden_dim=H,
         num_layers=num_layers,
         input_dim=input_dim,
         num_classes=num_classes,
+        residual_bias=residual_bias,
     )
     model.load_state_dict(ckpt["model"])
     model.eval()

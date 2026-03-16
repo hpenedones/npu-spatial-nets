@@ -62,6 +62,22 @@ void simple_head_forward_loss_bf16(
     }
 }
 
+void simple_head_infer_bf16(
+    bfloat16 *pooled,
+    bfloat16 *w_head,
+    bfloat16 *logits_out)
+{
+    for (int b = 0; b < BATCH_SIZE; ++b) {
+        for (int c = 0; c < NUM_CLASSES; ++c) {
+            float acc = 0.0f;
+            for (int h = 0; h < DIM_H; ++h) {
+                acc += (float)pooled[b * DIM_H + h] * (float)w_head[h * NUM_CLASSES + c];
+            }
+            logits_out[b * NUM_CLASSES + c] = (bfloat16)acc;
+        }
+    }
+}
+
 void simple_head_backward_bf16(
     bfloat16 *pooled,
     bfloat16 *w_head,

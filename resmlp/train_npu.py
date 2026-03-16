@@ -641,10 +641,16 @@ def main():
         if resume_ckpt
         else dataset_cfg["num_classes"]
     )
+    residual_bias = bool(resume_ckpt.get("residual_bias", False)) if resume_ckpt else False
     if input_dim != dataset_cfg["input_dim"] or num_classes != dataset_cfg["num_classes"]:
         raise ValueError(
             f"Checkpoint/input metadata ({input_dim} inputs, {num_classes} classes) "
             f"does not match dataset '{dataset_name}'"
+        )
+    if residual_bias:
+        raise ValueError(
+            "train_npu.py does not support residual-bias checkpoints yet because the current NPU "
+            "residual training kernels are bias-free."
         )
     args.dataset = dataset_name
 
@@ -653,6 +659,7 @@ def main():
         num_layers=num_layers,
         input_dim=input_dim,
         num_classes=num_classes,
+        residual_bias=False,
     )
     if resume_ckpt:
         model.load_state_dict(resume_ckpt["model"])
@@ -846,6 +853,7 @@ def main():
                 "num_cols": num_cols,
                 "input_dim": input_dim,
                 "num_classes": num_classes,
+                "residual_bias": False,
             }, path)
             print(f"    → saved {path}")
         elif args.pipeline == "full-npu" and epoch == args.epochs - 1:
@@ -861,6 +869,7 @@ def main():
                 "num_cols": num_cols,
                 "input_dim": input_dim,
                 "num_classes": num_classes,
+                "residual_bias": False,
             }, path)
             print(f"    → saved {path}")
 

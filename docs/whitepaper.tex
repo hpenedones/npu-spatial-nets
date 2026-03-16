@@ -1207,6 +1207,56 @@ limiting stage for throughput. The next systems win is not to squeeze a little
 more out of the tail worker, but to reduce or eliminate the CPU-side embed
 boundary.
 
+Public CIFAR-10 inference-throughput reporting is also much sparser than one
+might expect. MLPerf Inference does not currently include a CIFAR-10 task
+\cite{mlperf-inference}, so the most relevant public reference points come from
+older challenge leaderboards and accelerator-specific papers. Stanford DAWN's
+public CIFAR-10 inference leaderboard reports 0.1345~ms/image for a ResNet8
+TensorRT submission at 94.20\% accuracy (about 7{,}435 images/s), 0.6830~ms for
+a BaiduNet8 V100 submission at 94.32\% accuracy (about 1{,}464 images/s), and
+0.8280~ms for a custom ResNet9 P100 submission at 94.53\% accuracy (about
+1{,}208 images/s) \cite{dawn-cifar-inference}. FINN reports 21{,}906 CIFAR-10
+classifications/s at 80.1\% accuracy on a ZC706 FPGA platform under 25~W total
+system power \cite{finn-bnn}. QuTiBench's broader CIFAR-10 benchmark collection
+spans Jetson TX2 GPU, Xilinx DPU, FINN, BISMO, Edge TPU-class, and CPU points,
+with measured throughput ranging from hundreds of images/s on small edge
+deployments to tens of thousands on heavily quantized FPGA configurations
+\cite{qutibench-cifar,qutibench-paper}. We deliberately exclude recent A100
+CIFAR ``speedrun'' papers such as AIRBench from this comparison because those
+results optimize training time to an accuracy target, not steady-state
+inference throughput \cite{airbench-cifar-training}.
+
+Against that public inference-only context, the current sustained
+747{,}851~images/s wall-clock and 3.06~million images/s kernel-only figures are
+strikingly high. The correct caveat, however, is just as important as the
+throughput number itself: this $H=32$ operating point reaches only 51.20\% test
+accuracy, so it should be read as a systems-throughput result rather than as a
+claim that the current model achieves the best known accuracy/throughput
+tradeoff on CIFAR-10.
+
+Two follow-up experiments make that limitation much sharper. First, a plain
+GPU-trained CIFAR sanity baseline (\code{PreActResNet18}) reaches 90.66\% test
+accuracy after 10 epochs on the same machine, so the disappointing CIFAR result
+is not a statement that the local stack cannot learn CIFAR-10 at all. It is a
+statement about this particular high-throughput residual MLP. Second, a
+CIFAR-capable streamed convnet now runs correctly on hardware and matches the
+CPU reference numerically, but the correctness-first direct-convolution kernels
+collapse throughput to only about 355~images/s wall-clock for a 4-column shape
+and about 177~images/s for an 8-column shape, while validation accuracy is
+still only about 44.0\% and 35.6\%, respectively. In other words, the current
+repository contains two honest but incomplete CIFAR stories: a very fast MLP
+that is not yet accurate enough, and a numerically trustworthy conv path that
+is not yet remotely competitive on throughput.
+
+That is why CIFAR-10 should currently be read as a useful diagnostic workload,
+not as the cleanest headline demo for the resident-snake design. It exposed the
+host-side embed bottleneck very clearly, and it also showed that recovering
+spatial inductive bias without giving up the conveyor-belt throughput story is a
+substantially harder kernel-design problem than retargeting the existing MLP.
+Until the faster MMUL-style conv path is recovered, or the surrounding
+embed/head stages move onto the array, vector-style workloads remain the more
+natural fit for the throughput narrative.
+
 Taken together, these results are still strong while keeping the design
 conceptually modest:
 \begin{itemize}
@@ -1295,6 +1345,30 @@ AMD, \emph{AI Engine documentation (programming model and architecture)}.\newlin
 \bibitem{qutibench-mnist}
 M. Blott et al., \emph{QuTiBench MNIST classification benchmark collection}.\newline
 \url{https://rcl-lab.github.io/QutibenchWeb/mnist/rooflines/performance%20prediction/2020/03/25/MNIST_Classification.html}
+
+\bibitem{qutibench-cifar}
+RCL-lab, \emph{QuTiBench CIFAR-10 classification benchmark collection}.\newline
+\url{https://rcl-lab.github.io/QutibenchWeb/cifar-10/rooflines/performance%20prediction/2020/03/25/CIFAR-10_Classification.html}
+
+\bibitem{qutibench-paper}
+M. Blott et al., \emph{QuTiBench: Benchmarking Neural Networks on Heterogeneous Hardware}.\newline
+\url{https://doi.org/10.1145/3358700}
+
+\bibitem{mlperf-inference}
+MLCommons, \emph{MLPerf Inference benchmark suite documentation}.\newline
+\url{https://docs.mlcommons.org/inference/}
+
+\bibitem{dawn-cifar-inference}
+Stanford DAWN, \emph{CIFAR-10 inference leaderboard}.\newline
+\url{https://dawnd9.sites.stanford.edu/cifar10-inference}
+
+\bibitem{finn-bnn}
+Y. Umuroglu et al., \emph{FINN: A Framework for Fast, Scalable Binarized Neural Network Inference}.\newline
+\url{https://arxiv.org/abs/1612.07119}
+
+\bibitem{airbench-cifar-training}
+K. Jordan et al., \emph{94\% on CIFAR-10 in 3.29 Seconds on a Single GPU}.\newline
+\url{https://arxiv.org/abs/2404.00498}
 
 \bibitem{batch-size-gpu-tpu}
 Y. Gordienko et al., \emph{Batch Size Influence on Performance of Graphic and Tensor Processing Units During Training and Inference Phases}.\newline

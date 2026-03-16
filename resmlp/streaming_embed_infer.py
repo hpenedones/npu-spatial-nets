@@ -50,10 +50,15 @@ class EmbedResidualStreamingInferenceService:
             ckpt = torch.load(checkpoint, map_location="cpu", weights_only=True)
             hidden_dim = ckpt.get("hidden_dim", hidden_dim)
             num_layers = ckpt.get("num_layers", self.num_layers)
+            residual_bias = bool(ckpt.get("residual_bias", False))
             if hidden_dim != self.hidden_dim or num_layers != self.num_layers:
                 raise ValueError(
                     f"Checkpoint/model mismatch: expected hidden_dim={self.hidden_dim}, "
                     f"num_layers={self.num_layers}, got hidden_dim={hidden_dim}, num_layers={num_layers}"
+                )
+            if residual_bias:
+                raise ValueError(
+                    "The embed-on-NPU residual prototype does not support residual-bias checkpoints yet."
                 )
             self.pipeline = ckpt.get("pipeline", "hybrid")
             self.epoch = ckpt.get("epoch")

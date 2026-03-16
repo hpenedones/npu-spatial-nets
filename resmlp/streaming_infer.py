@@ -56,6 +56,7 @@ class ResidualStreamingInferenceService:
         self.num_layers = num_layers if num_layers is not None else ckpt.get("num_layers", 32)
         self.input_dim = ckpt.get("input_dim", dataset_cfg["input_dim"])
         self.num_classes = ckpt.get("num_classes", dataset_cfg["num_classes"])
+        self.residual_bias = bool(ckpt.get("residual_bias", False))
         self.pipeline = ckpt.get("pipeline", "hybrid")
         self.epoch = ckpt["epoch"]
         self.eval_split = ckpt.get("eval_split", "test")
@@ -72,12 +73,18 @@ class ResidualStreamingInferenceService:
                 "streaming inference pipeline can only handle models with either all tiles "
                 "used as residual layers or with 2 identity-padded endpoints."
             )
+        if self.residual_bias:
+            raise ValueError(
+                "Streaming NPU residual inference does not support residual-bias checkpoints yet. "
+                "Train/evaluate them on CPU/GPU first or add residual-bias support to the NPU kernels."
+            )
 
         self.model = ResMLP(
             hidden_dim=self.hidden_dim,
             num_layers=self.num_layers,
             input_dim=self.input_dim,
             num_classes=self.num_classes,
+            residual_bias=self.residual_bias,
         )
         self.model.load_state_dict(ckpt["model"])
         self.model.eval()
