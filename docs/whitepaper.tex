@@ -1391,7 +1391,11 @@ trained for only 5 epochs on the AMD Radeon 890M ROCm path. Even with the full
 100k validation pass every epoch, training took only about 27.8s/epoch, or
 roughly 374k training samples/s wall-clock. I then repeated the same 5-epoch
 recipe with the deeper $H=32$, $L=32$ model; that run took about 36.2s/epoch,
-still only about 1.3$\times$ slower than the 8-layer point.
+still only about 1.3$\times$ slower than the 8-layer point. Because the deeper
+curve was still improving at the end of that pilot, I also reran the same
+$H=32$, $L=32$ model on a clean 20-epoch cosine schedule. Its best checkpoint
+arrived at epoch 18 and improved the full-data metrics again without obvious
+signs of overfitting.
 
 \begin{table}[h]
 \centering
@@ -1400,14 +1404,17 @@ still only about 1.3$\times$ slower than the 8-layer point.
 \toprule
 Model & Test acc. & ROC AUC & PR AUC & Log loss \\
 \midrule
-$H=32$, $L=8$ full-data & 75.89\% & 0.8430 & 0.8559 & 0.4861 \\
-$H=32$, $L=32$ full-data & 76.56\% & 0.8502 & 0.8628 & 0.4762 \\
+$H=32$, $L=8$ full-data (5 epochs) & 75.89\% & 0.8430 & 0.8559 & 0.4861 \\
+$H=32$, $L=32$ full-data (5 epochs) & 76.56\% & 0.8502 & 0.8628 & 0.4762 \\
+$H=32$, $L=32$ full-data (20-epoch schedule) & 76.98\% & 0.8542 & 0.8668 & 0.4705 \\
 \bottomrule
 \end{tabular}
 \caption{Full-data HIGGS results on the public \code{jxie/higgs} mirror. The
 local cache uses the full published train/test splits (10.5M/500k rows);
 training holds out 100k examples for validation and fits on the remaining
-10.4M examples for 5 epochs with the same AdamW/cosine recipe.}
+10.4M examples. The first two rows use the 5-epoch pilot recipe; the final row
+extends the 32-layer model to a clean 20-epoch cosine schedule and reports the
+best checkpoint from that longer run.}
 \label{tab:higgs-full-first}
 \end{table}
 
@@ -1415,9 +1422,12 @@ Those full-data results materially strengthen the HIGGS story. The same minimal
 8-layer model that previously landed near 0.795 ROC AUC on the smaller public
 pilot now reaches 0.843 ROC AUC and 75.89\% accuracy on the fixed
 500k-example test set once it sees the full public training pool. The deeper
-32-layer model improves that further to 0.850 ROC AUC and 76.56\% accuracy,
-buying about 0.67 percentage points of test accuracy and roughly 0.007 ROC AUC
-for only a modest increase in epoch time. These are still not tuned
+32-layer model improves that further to 0.850 ROC AUC and 76.56\% accuracy in
+the 5-epoch pilot, and to 0.854 ROC AUC with 76.98\% accuracy once it is given
+a proper 20-epoch schedule. That longer run buys another 0.42 percentage
+points of test accuracy and about 0.004 ROC AUC beyond the already-strong
+5-epoch 32-layer point, which is a useful sign that the model was still
+undertrained rather than overfit. These are still not tuned
 state-of-the-art tabular numbers, but they are clearly no longer just
 synthetic-throughput props either: the resident-snake operating points remain
 genuine large-tabular classifiers once the data scale becomes realistic.
