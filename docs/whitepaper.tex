@@ -1339,24 +1339,30 @@ stay in that same accuracy band once they are trained on real public data. For
 that pilot, I used the public Hugging Face mirror of the HIGGS benchmark splits
 \cite{jxie-higgs}, merged \code{train\_63k} and \code{val\_16k} into the local
 training pool, kept \code{test\_20k} fixed, and held out 15{,}688 examples
-inside the training pool for model selection. That is not byte-for-byte the
-exact RTDL protocol, but it is close enough to test the practical question that
-matters here: whether the throughput-friendly residual MLP remains a useful
-classifier once the data are real.
+inside the training pool for model selection. Both models were trained for 20
+epochs with AdamW ($\text{lr}=3\times10^{-3}$, weight decay $10^{-4}$), a
+cosine schedule down to $10^{-4}$, batch size 2048, no label smoothing, and no
+data augmentation; the best checkpoints landed at epoch 19 for the $L=8$ model
+and epoch 16 for the $L=32$ model. That is not byte-for-byte the exact RTDL
+protocol, but it is close enough to test the practical question that matters
+here: whether the throughput-friendly residual MLP remains a useful classifier
+once the data are real.
 
 \begin{table}[h]
 \centering
-\small
-\begin{tabular}{@{}lcc@{}}
+\footnotesize
+\begin{tabular}{@{}lcccc@{}}
 \toprule
-Model & CPU test accuracy & Streamed NPU test accuracy \\
+Model & CPU acc. & CPU ROC AUC & CPU PR AUC & Streamed NPU acc. \\
 \midrule
-$H=32$, $L=8$ & 71.76\% & 71.81\% \\
-$H=32$, $L=32$ & 72.04\% & 72.03\% \\
+$H=32$, $L=8$ & 71.76\% & 0.7946 & 0.8099 & 71.81\% \\
+$H=32$, $L=32$ & 72.04\% & 0.7956 & 0.8074 & 72.03\% \\
 \bottomrule
 \end{tabular}
 \caption{Real HIGGS pilot on the public \code{jxie/higgs} mirror. The streamed
-residual path already reproduces the CPU reference closely on real public data.}
+residual path already reproduces the CPU reference closely on real public data,
+and the CPU checkpoints land near 0.795 ROC AUC on the fixed 19{,}610-example
+test split.}
 \label{tab:higgs-real-pilot}
 \end{table}
 
@@ -1367,6 +1373,10 @@ far, lands within about one percentage point of the strongest tuned
 \code{higgs\_small} baselines in Table~\ref{tab:higgs-small-rtdl}. Just as
 importantly, the streamed NPU body reproduces the CPU reference to within
 measurement noise, so the deployment path is numerically credible.
+When the fused 2-class NPU head is enabled, the ranking metrics remain
+essentially unchanged: the $L=8$ checkpoint moves from ROC/PR AUC
+$0.7946/0.8099$ on CPU to $0.7947/0.8100$ on the NPU-head path, and the $L=32$
+checkpoint moves from $0.7956/0.8074$ to $0.7956/0.8075$.
 
 Once that real-data check passed, the next obvious question was whether the tiny
 $32 \to 2$ classifier head should also move on-array. The answer is
