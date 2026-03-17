@@ -1,96 +1,45 @@
 # TODO
 
-The goal of this file is to keep the paper backlog focused on a simple rule:
-every important claim should trace cleanly to either a citation, a figure, a
-table, or a reproducible experiment.
+Every important claim should trace cleanly to either a citation, a figure, a
+table, or a reproducible experiment. Below we antecipate some hard review questions,
+so that we can address them in the paper.
 
-## Measurements and baselines
+## Hard review questions
 
-- [ ] Quantify the current CPU embed overhead
-  - Measure how much of the current wall-clock time is spent in the host-side
-    `28 -> 32` embed.
-  - Estimate how much headroom could be recovered by moving that step on-array.
-  - Use that number to sharpen the motivation for the next systems step.
 
-- [ ] Expand the latency analysis
-  - Measure single-sample latency for the conveyor-belt NPU path.
-  - Measure tail latency, for example p99, instead of reporting throughput
-    alone.
-  - Add either a latency distribution plot or a compact latency table to the
-    paper.
 
-- [ ] Document benchmark methodology and variability
-  - State warm-up policy, sample count, repetition count, and whether weights
-    are already resident on the device.
-  - Define precisely what is included in wall time versus kernel time.
-  - Repeat the key benchmarks enough to report a compact variability summary
-    rather than a single point estimate.
+1. Lack of Competitive "Physics" Baselines - A demanding reviewer might argue that the paper compares the model to itself rather than the current standard in the field.
 
-- [ ] Add a standard HEP baseline comparison
-  - Compare accuracy and throughput against a strong tabular baseline such as
-    XGBoost or LightGBM on CPU.
-  - Optionally include a small MLP baseline on a mobile GPU.
-  - If the numbers support it, frame the comparison in terms of
-    efficiency-per-dollar or efficiency-per-watt.
+  - The Argument: "While 77.98% accuracy is 'statistically credible,' it is significantly lower than current SOTA for HIGGS, which often exceeds 80% or 0.88+ ROC AUC using Deep Sets or advanced Transformers. Without a side-by-side comparison of the NPU's efficiency (samples/s/watt) against a GPU running a SOTA model, the systems case is incomplete." 
 
-- [ ] Discuss scaling to wider feature sets
-  - Explain how the conveyor-belt design changes as the input becomes wider.
-  - State more explicitly when the 64 KB per-tile SRAM becomes the hard
-    bottleneck.
-  - Briefly connect this to more realistic jet-tagging or richer HEP feature
-    pipelines.
+  - The "Mean" Critique: "This is essentially a high-speed implementation of an outdated model."
 
-- [ ] Add quantitative SRAM-budget accounting
-  - Break down per-tile memory use for weights, activations, and buffers.
-  - Show why the retained hidden widths fit and when they stop fitting.
-  - Reuse the same accounting to support the wider-input discussion.
+2. "Incomplete" On-Chip Deployment - The fact that the embed and the head are on the CPU is a major target for a systems-focused reviewer.
 
-## Framing, figures, and literature
+  - The Argument: "The paper claims a 'NPU-native' design, yet the fastest operating point relies on the host CPU for both the ingress (embed) and egress (head) stages. This introduces a 'hidden' latency and power cost associated with the PCIe/memory bus that isn't fully accounted for in the 'Kernel Throughput' metrics." 
 
-- [ ] Add a claim-by-claim evidence audit
-  - Enumerate each quantitative, comparative, or systems claim in the paper.
-  - Tag each claim with its backing source: citation, table, figure, or local
-    experiment artifact.
-  - Rephrase or remove any sentence that cannot be defended cleanly.
+  - The "Mean" Critique: "The NPU is merely a co-processor here; the paper fails to demonstrate a truly standalone spatial dataflow pipeline."
 
-- [ ] Strengthen related-work positioning
-  - Add a compact comparison against classic HIGGS baselines, HEP trigger or
-    low-latency inference work, and relevant accelerator or spatial-computing
-    literature.
-  - Make the novelty statement explicit and well-bounded.
-  - Clarify what is new here versus what is inherited from the benchmark or the
-    toolchain.
+3. Limited Architectural Diversity - A reviewer looking for "ML novelty" might find the residual MLP too simple.
 
-- [ ] Plot the accuracy-throughput frontier
-  - Put the retained operating points on one figure so the trade-off is visible
-    at a glance.
-  - If the baseline comparison is strong, place those points on the same plot.
-  - Use the figure to support the ``best throughput point'' versus ``best
-    accuracy point'' narrative.
+  - The Argument: "The 'conveyor-belt' mapping is specific to a very narrow class of sequential residual MLPs. The paper does not demonstrate how this approach scales to more complex topologies used in modern jet tagging, such as Graph Neural Networks (GNNs) or Attention mechanisms, which are the primary interest of the ML4Jets community." 
 
-- [ ] Add an in-paper model-to-hardware figure
-  - Show the CPU-side embed, the NPU conveyor-belt residual body, and the final
-    head placement options.
-  - Make the tile-to-block correspondence visible.
-  - Use the figure to reduce the amount of explanation needed in the text.
+  - The "Mean" Critique: "The hardware-to-model mapping is trivial because the model was simplified until it fit the hardware, rather than solving the harder problem of mapping complex models to spatial arrays."
 
-- [ ] Tighten claim boundaries and limitations
-  - Add a short explicit limitations or scope subsection to the paper.
-  - State clearly what is not being claimed: production trigger readiness,
-    state-of-the-art HIGGS accuracy, fully on-array execution, or
-    energy-efficiency leadership.
-  - Tie the trigger-motivation discussion to cited rates and measured numbers
-    without implying deployment equivalence.
+4. Throughput vs. Latency Metrics - In High-Energy Physics, deterministic latency is often more important than aggregate throughput. 
 
-## Suggested order
+  - The Argument: "The paper reports 'Repeated-sample throughput' over 50M samples. In a real Level-1 trigger environment, we care about the worst-case latency for a single bunch crossing. The paper provides no jitter analysis or $99^{th}$ percentile latency figures, making it impossible to evaluate for real-time trigger suitability."
 
-1. Quantify the CPU embed overhead.
-2. Expand the latency analysis.
-3. Document benchmark methodology and variability.
-4. Add the HEP baseline comparison.
-5. Add the wider-input discussion together with SRAM-budget accounting.
-6. Plot the accuracy-throughput frontier.
-7. Add the in-paper model-to-hardware figure.
-8. Strengthen related-work positioning.
-9. Run the claim-by-claim evidence audit.
-10. Finish with the limitations / claim-boundary pass.
+  - The "Mean" Critique: "High throughput via batching is easy; low-latency, single-sample determinism is what actually matters for triggers."
+
+5. Not using the full NPU
+
+  The Argument: "On the 8 Layer MLP, you leave 3/4 of the compute tiles of the NPU unused. Could you use them to launch 4 parallel instances of the model and get 4x the throughput?" 
+
+  - The "Mean" Critique: "you left performance on the table, and it was low hanging fruit"
+
+6 - No results for 16 layer MLP
+
+  The Argument: "You only show results for the 8 and 32 layer MLPs. Why not show results for the 16 layer MLP?" 
+
+  - The "Mean" Critique: "you didn't fully explore the design space"
