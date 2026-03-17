@@ -53,12 +53,15 @@ dense event filtering on cheap consumer hardware.
 \section{Introduction}
 
 Modern NPUs become most interesting when they stop being treated as ``small
-GPUs'' and are programmed as what they really are: spatial dataflow machines.
-On AMD XDNA~2, the programmer sees a 2D array of compute tiles, each with local
-SRAM, a VLIW plus SIMD core, a matrix-multiply unit, and explicit routing.
-That changes the network-design problem. The central question is no longer just
-``what architecture is accurate?'', but also ``what architecture maps cleanly to
-many tiny memories connected by explicit streams?''.
+GPUs'' and start being treated more like conveyor belts. Instead of launching
+one large shared-memory kernel, the programmer assigns a small local job to one
+tile, hands the activations to the next tile, and repeats this until the full
+network has been traversed. That is the intuition behind spatial dataflow
+hardware. On AMD XDNA~2, the programmer sees a 2D array of compute tiles, each
+with local SRAM, a VLIW plus SIMD core, a matrix-multiply unit, and explicit
+routing. The central question is therefore no longer just ``what architecture
+is accurate?'', but also ``what architecture maps cleanly to many tiny memories
+connected by explicit streams?''.
 
 The focus here is deliberately narrow: a residual MLP for HIGGS, with one
 residual matrix per tile and a forward-only conveyor-belt deployment on the
@@ -121,7 +124,16 @@ current throughput point, the tiny final $H \rightarrow 2$ classifier head.
 
 \section{A residual network that matches the array}
 
-The network studied here is intentionally minimal:
+The network studied here is intentionally minimal.
+
+\subsection*{Notation}
+
+We use $H$ for hidden width, $L$ for the number of residual blocks, and $B$ for
+batch size. In the deployment path studied here, one residual block maps to one
+compute tile.
+
+\subsection*{Model definition}
+
 \[
   h_{\ell+1} = \mathrm{ReLU}(h_{\ell} W_{\ell}) + h_{\ell},
   \qquad \ell = 0,\dots,L-1.
@@ -152,22 +164,18 @@ simple enough to analyze and direct enough to deploy.
 
 \section{From Python model to NPU artifact}
 
-The kept toolchain is deliberately short.
-\begin{enumerate}
-  \item \code{aie\_kernels/matmul\_relu\_skip.cc} defines the tile-local
-        residual kernel.
-  \item \code{resmlp/streaming\_design.py} generates the conveyor-belt MLIR-AIE
-        program for a chosen $(H, B, L)$ shape.
-  \item \code{resmlp/streaming\_op.py} wraps the compiled XCLBIN and instruction
-        binary as a resident XRT operator.
-  \item \code{resmlp/streaming\_infer.py} evaluates trained checkpoints and runs
-        the repeated-sample throughput benchmark used in this paper.
-\end{enumerate}
+The toolchain is deliberately short. We start from
+\code{aie\_kernels/matmul\_relu\_skip.cc}, which defines the tile-local
+residual kernel. We then use \code{resmlp/streaming\_design.py} to generate the
+conveyor-belt MLIR-AIE program for a chosen $(H, B, L)$ shape.
+\code{resmlp/streaming\_op.py} wraps the compiled XCLBIN and instruction binary
+as a resident XRT operator. Finally, \code{resmlp/streaming\_infer.py} drives
+trained checkpoints through that operator and measures wall-clock throughput.
 
 A key detail of the current forward path is that the residual weights are
-embedded at compile time. In other words, each checkpoint-specific throughput
-run builds a checkpoint-specific streaming artifact. That is not the most
-general deployment contract, but it is the cleanest way to study the geometry,
+embedded at compile time. Each throughput run therefore builds a
+checkpoint-specific streaming artifact. That is not the most general
+deployment contract. It is, however, the cleanest way to study the geometry,
 routing, and wall-clock behavior of a resident conveyor-belt design.
 
 \section{Training protocol on HIGGS}
@@ -175,11 +183,12 @@ routing, and wall-clock behavior of a resident conveyor-belt design.
 The data pipeline uses the public \code{jxie/higgs} mirror of the published
 train/test splits \cite{jxie-higgs}. The local cache materializer produces a
 fixed 10.5M-example train split and a fixed 500k-example test split. For model
-selection, training holds out 100k examples from the train split, leaving 10.4M
-examples for optimization. All reported runs use the native 28-dimensional
-feature vector without any padded-width preprocessing. Hyperparameter search and
-checkpoint selection use held-out validation accuracy; the 500k-example test
-split is used only for final evaluation of already-selected models.
+selection, training holds out 100k examples from the train split. That leaves
+10.4M examples for optimization. All reported runs use the native
+28-dimensional feature vector without any padded-width preprocessing.
+Hyperparameter search and checkpoint selection use held-out validation
+accuracy. The 500k-example test split is used only for final evaluation of
+already-selected models.
 
 HIGGS is also a good benchmark because it sits at the intersection of two real
 literatures. In high-energy physics it is a canonical dense-event benchmark
@@ -245,12 +254,13 @@ final reporting.}
 \label{tab:higgs-full-results}
 \end{table}
 
-Two observations matter. First, depth helps: moving from $L=8$ to $L=32$
+Two observations matter. First, depth helps. Moving from $L=8$ to $L=32$
 improves every metric even before any serious hyperparameter search. Second,
-validation-driven hyperparameter tuning moves the result from the high-0.85 ROC
-band to 0.865 ROC AUC while also improving accuracy, PR AUC, and log loss.
-This is still not a claim of state-of-the-art HIGGS accuracy, but it is strong
-enough that the main contribution of the paper is no longer accuracy-indifferent.
+validation-driven hyperparameter tuning pushes the result from the high-0.85
+ROC band to 0.865 ROC AUC. It also improves accuracy, PR AUC, and log loss.
+This is still not a claim of state-of-the-art HIGGS accuracy. It is, however,
+strong enough that the main contribution of the paper is no longer
+accuracy-indifferent.
 
 \subsection{Throughput of the conveyor-belt deployment}
 
@@ -284,7 +294,11 @@ is slower than keeping that tiny classifier on CPU. That is an important honest
 result: the right abstraction boundary in the current implementation is a CPU
 embed, NPU residual body, and CPU head. The next hardware step is therefore not
 ``force everything on-array'' but ``move the expensive surrounding stages only
-when they really improve wall time''.
+when they really improve wall time''. A plausible reason is that the
+$H \rightarrow 2$ head is simply too small to amortize the extra synchronization,
+buffer traffic, and launch overheads of the fused tail path. In other words,
+the additional runtime machinery costs more than the CPU saves on this tiny
+matrix multiply.
 
 \section{Discussion}
 
