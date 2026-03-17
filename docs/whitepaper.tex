@@ -17,39 +17,37 @@
   urlcolor=blue!60!black,
   citecolor=blue!60!black,
   pdftitle={NPU-Native Neural Networks on AMD XDNA 2},
-  pdfauthor={npu-nets project}
+  pdfauthor={Hugo Penedones}
 }
 \setlist{nosep}
 
 \newcommand{\code}[1]{\texttt{#1}}
-\newcommand{\repo}{\texttt{npu-nets}}
 
 \title{NPU-Native Neural Networks on AMD XDNA~2}
-\author{Built with \href{https://github.com/amd/IRON}{IRON/MLIR-AIE} --- target device: AMD Ryzen AI 9 HX 370 (Strix Point)}
+\author{Hugo Penedones}
 \date{}
 
 \begin{document}
 \maketitle
 
 \begin{center}
-\large A curated paper branch for conveyor-belt residual inference on HIGGS
+\large Conveyor-belt residual inference for HIGGS on AMD XDNA~2
 \end{center}
 
 \begin{abstract}
-This whitepaper studies one deliberately narrow question: what neural-network
-shape matches the AMD XDNA~2 NPU when the goal is high-throughput,
-low-latency inference on dense collider-style features? The answer in the
-curated \code{main} branch is a forward-only residual MLP whose hidden body is
-laid out as a conveyor belt across the 32 compute tiles of the Strix Point
-array. Using the public HIGGS benchmark, the repository now reports two honest
-operating points: a throughput-oriented $H=32$, $L=8$ configuration that
-sustains about 4.18M samples/s wall-clock with the tiny classifier head left on
-CPU, and a full-data $H=64$, $L=32$ model trained on 10.4M examples that
-reaches 77.98\% test accuracy, 0.865 ROC AUC, and 0.877 PR AUC on the fixed
-500k-example test split. The point is not that this already wins every accuracy
-leaderboard; it is that the design is small enough to understand end to end,
-yet strong enough to make a credible systems case for dense event filtering on
-cheap consumer hardware.
+This paper studies a deliberately narrow question: what neural-network shape
+matches the AMD XDNA~2 NPU when the goal is high-throughput, low-latency
+inference on dense collider-style features? The answer explored here is a
+forward-only residual MLP whose hidden body is laid out as a conveyor belt
+across the 32 compute tiles of the Strix Point array. Using the public HIGGS
+benchmark, we report two operating points: a throughput-oriented $H=32$,
+$L=8$ configuration that sustains about 4.18M samples/s wall-clock with the
+tiny classifier head left on CPU, and a full-data $H=64$, $L=32$ model trained
+on 10.4M examples that reaches 77.98\% test accuracy, 0.865 ROC AUC, and 0.877
+PR AUC on the fixed 500k-example test split. The point is not that this model
+already wins every accuracy leaderboard; it is that the design is small enough
+to understand end to end, yet strong enough to make a credible systems case for
+dense event filtering on cheap consumer hardware.
 \end{abstract}
 
 \section{Introduction}
@@ -62,13 +60,12 @@ That changes the network-design problem. The central question is no longer just
 ``what architecture is accurate?'', but also ``what architecture maps cleanly to
 many tiny memories connected by explicit streams?''.
 
-This repository now answers that question with a single main-branch story. The
-kept path is a residual MLP for HIGGS, with one residual matrix per tile and a
-forward-only conveyor-belt deployment on the NPU. Older MNIST, CIFAR, convnet,
-and on-array backward-pass work has been moved out of the paper narrative and
-preserved only in \code{logbook.md} and on the \code{experimental} branch.
+The focus here is deliberately narrow: a residual MLP for HIGGS, with one
+residual matrix per tile and a forward-only conveyor-belt deployment on the
+NPU. The aim is not to survey every model family or every use of XDNA~2, but
+to isolate one design that can be understood end to end.
 
-HIGGS is the right benchmark for this branch. It is a dense 28-feature binary
+HIGGS is a natural benchmark for this study. It is a dense 28-feature binary
 classification task derived from collider events, introduced by Baldi,
 Sadowski, and Whiteson as a large-scale signal-versus-background benchmark with
 roughly 11 million examples \cite{baldi-higgs,uci-higgs}. That makes a residual
@@ -86,15 +83,13 @@ throughput.
 Figure~\ref{fig:xdna-layout} shows the physical layout targeted here. The Ryzen
 AI 9 HX 370 exposes 32 compute tiles arranged as 8 columns by 4 compute rows.
 Below them sit 8 MemTiles, and below those 8 shim tiles that connect the array
-to host-visible memory and runtime control. The curated main branch keeps only
-the forward residual-inference path built on top of this full array.
+to host-visible memory and runtime control.
 
 \begin{figure}[t]
 \centering
 \includegraphics[width=0.92\textwidth]{xdna2_hardware.png}
-\caption{Physical layout of the AMD XDNA~2 NPU used here. The paper branch
-keeps a forward residual pipeline that can use up to all 32 compute tiles (8
-columns $\times$ 4 rows).}
+\caption{Physical layout of the AMD XDNA~2 NPU used here. The design studied in
+this paper can use up to all 32 compute tiles (8 columns $\times$ 4 rows).}
 \label{fig:xdna-layout}
 \end{figure}
 
@@ -109,10 +104,10 @@ Property & Why it matters here \\
 About 64 KB local SRAM per compute tile & Parameters must stay small enough to live locally; that strongly constrains hidden width. \\
 8$\times$8 MMUL-friendly blocked execution & Widths and batch sizes should be divisible by 8, and host-side packing must respect tiled layouts. \\
 Explicit FIFOs, DMA, and routing & Data movement is part of the design, not an afterthought hidden behind a cache hierarchy. \\
-IRON / MLIR-AIE / XRT software stack & The repository programs the array close to the hardware model rather than through a high-level opaque runtime. \\
+IRON / MLIR-AIE / XRT software stack & The implementation programs the array close to the hardware model rather than through a high-level opaque runtime. \\
 \bottomrule
 \end{tabularx}
-\caption{Only a few hardware facts matter for the paper branch. The most
+\caption{Only a few hardware facts matter for this paper. The most
 important is not the marketing TOPS number, but the combination of tiny tile
 memories and explicit data movement.}
 \label{tab:hardware-constraints}
@@ -126,14 +121,14 @@ current throughput point, the tiny final $H \rightarrow 2$ classifier head.
 
 \section{A residual network that matches the array}
 
-The main-branch network is intentionally minimal:
+The network studied here is intentionally minimal:
 \[
   h_{\ell+1} = \mathrm{ReLU}(h_{\ell} W_{\ell}) + h_{\ell},
   \qquad \ell = 0,\dots,L-1.
 \]
 Each residual matrix $W_{\ell}$ is assigned to one compute tile. Activations
 enter the array, flow through the tiles in a snake, and return to the host only
-after the full hidden body has completed. In the curated deployment path:
+after the full hidden body has completed. In the current deployment path:
 \begin{itemize}
   \item the host CPU runs the input projection from the native 28 HIGGS features
         to hidden width $H$,
@@ -152,8 +147,8 @@ This design leads to two practical operating points.
 \end{itemize}
 
 The important design choice is not just ``use an MLP'', but ``use an MLP whose
-depth and width map almost literally to the array''. That is what keeps the
-paper branch small, teachable, and reproducible.
+depth and width map almost literally to the array''. That keeps the design
+simple enough to analyze and direct enough to deploy.
 
 \section{From Python model to NPU artifact}
 
@@ -177,12 +172,14 @@ routing, and wall-clock behavior of a resident conveyor-belt design.
 
 \section{Training protocol on HIGGS}
 
-The dataset path kept on \code{main} uses the public \code{jxie/higgs} mirror of
-the published train/test splits \cite{jxie-higgs}. The local cache materializer
-produces a fixed 10.5M-example train split and a fixed 500k-example test split.
-For model selection, training holds out 100k examples from the train split,
-leaving 10.4M examples for optimization. All reported runs use the native
-28-dimensional feature vector without the older padded-width legacy path.
+The data pipeline uses the public \code{jxie/higgs} mirror of the published
+train/test splits \cite{jxie-higgs}. The local cache materializer produces a
+fixed 10.5M-example train split and a fixed 500k-example test split. For model
+selection, training holds out 100k examples from the train split, leaving 10.4M
+examples for optimization. All reported runs use the native 28-dimensional
+feature vector without any padded-width preprocessing. Hyperparameter search and
+checkpoint selection use held-out validation accuracy; the 500k-example test
+split is used only for final evaluation of already-selected models.
 
 HIGGS is also a good benchmark because it sits at the intersection of two real
 literatures. In high-energy physics it is a canonical dense-event benchmark
@@ -191,7 +188,7 @@ large-data problems on which tree ensembles such as XGBoost, LightGBM, and
 CatBoost remain strong baselines, while modern deep tabular models are now more
 competitive but not universally dominant \cite{xgboost-kdd,lightgbm-nips,catboost-paper,rtdl-revisiting,grinsztajn-tabular}.
 That means good-enough accuracy on HIGGS is genuinely worth caring about, even
-if the main contribution of this repository is still systems-oriented.
+if the main contribution of this work is still systems-oriented.
 
 \begin{table}[t]
 \centering
@@ -206,16 +203,16 @@ $3\times10^{-3} \rightarrow 10^{-4}$, weight decay $10^{-4}$, no label smoothing
 $H=32$, $L=32$ long schedule &
 20 epochs on the AMD Radeon 890M ROCm path; AdamW, batch 8192, cosine
 $3\times10^{-3} \rightarrow 10^{-4}$, weight decay $10^{-4}$, no label smoothing. \\
-$H=64$, $L=32$ overnight winner &
+$H=64$, $L=32$ validation-selected tuning run &
 Best checkpoint at epoch 46 of a 50-epoch MLflow/Optuna sweep on the AMD
 Radeon 890M ROCm path; AdamW, batch 4096, cosine
 $1.069\times10^{-3} \rightarrow 8.70\times10^{-5}$, weight decay
 $3.23\times10^{-3}$, label smoothing $0.0197$. \\
 \bottomrule
 \end{tabularx}
-\caption{Training recipes for the main reported HIGGS checkpoints. The paper
-branch keeps both the plain training entry point and the MLflow/Optuna sweep
-driver because both were used to produce the current best results.}
+\caption{Training recipes for the reported HIGGS checkpoints. Both direct runs
+and validation-driven hyperparameter search were used to produce the reported
+models.}
 \label{tab:training-protocol}
 \end{table}
 
@@ -224,9 +221,9 @@ driver because both were used to produce the current best results.}
 \subsection{Accuracy on the full public HIGGS split}
 
 Table~\ref{tab:higgs-full-results} summarizes the current full-data results.
-The key point is that the repository is no longer trading only on a throughput
-narrative. Even this deliberately hardware-friendly residual MLP becomes a
-credible classifier once it is trained on the full public HIGGS data.
+The key point is that the systems design is not accuracy-indifferent. Even this
+deliberately hardware-friendly residual MLP becomes a credible classifier once
+it is trained on the full public HIGGS data.
 
 \begin{table}[t]
 \centering
@@ -238,7 +235,7 @@ Model & Test acc. & ROC AUC & PR AUC & Log loss \\
 $H=32$, $L=8$ full-data (5 epochs) & 75.89\% & 0.8430 & 0.8559 & 0.4861 \\
 $H=32$, $L=32$ full-data (5 epochs) & 76.56\% & 0.8502 & 0.8628 & 0.4762 \\
 $H=32$, $L=32$ full-data (20 epochs) & 76.98\% & 0.8542 & 0.8668 & 0.4705 \\
-Optuna best: $H=64$, $L=32$ & 77.98\% & 0.8653 & 0.8770 & 0.4543 \\
+Validation-selected tuning run: $H=64$, $L=32$ & 77.98\% & 0.8653 & 0.8770 & 0.4543 \\
 \bottomrule
 \end{tabular}
 \caption{Full-data HIGGS results on the public \code{jxie/higgs} mirror. The
@@ -250,11 +247,10 @@ final reporting.}
 
 Two observations matter. First, depth helps: moving from $L=8$ to $L=32$
 improves every metric even before any serious hyperparameter search. Second,
-the overnight sweep is worth keeping on \code{main}: the best completed trial
-moves from the high-0.85 ROC band to 0.865 ROC AUC while also improving
-accuracy, PR AUC, and log loss. This is still not a claim of state-of-the-art
-HIGGS accuracy, but it is strong enough that the repository's main story is no
-longer accuracy-indifferent.
+validation-driven hyperparameter tuning moves the result from the high-0.85 ROC
+band to 0.865 ROC AUC while also improving accuracy, PR AUC, and log loss.
+This is still not a claim of state-of-the-art HIGGS accuracy, but it is strong
+enough that the main contribution of the paper is no longer accuracy-indifferent.
 
 \subsection{Throughput of the conveyor-belt deployment}
 
@@ -284,27 +280,27 @@ winner remains the 8-layer, 2-column path with the classifier head left on CPU.}
 This table sharpens the systems conclusion. The best current wall-clock point
 is not the deepest model, and it is not the version with the entire graph moved
 onto the array. On the present tail kernel, the fused $H \rightarrow 2$ NPU head
-is slower than keeping that tiny classifier on CPU. For the curated branch,
-that is an important honest result: the right abstraction boundary today is a
-CPU embed, NPU residual body, and CPU head. The next hardware step is therefore
-not ``force everything on-array'' but ``move the expensive surrounding stages
-only when they really improve wall time''.
+is slower than keeping that tiny classifier on CPU. That is an important honest
+result: the right abstraction boundary in the current implementation is a CPU
+embed, NPU residual body, and CPU head. The next hardware step is therefore not
+``force everything on-array'' but ``move the expensive surrounding stages only
+when they really improve wall time''.
 
-\section{What this paper branch now claims}
+\section{Discussion}
 
-The cleaned main branch makes a narrow but defensible claim.
+This study makes a narrow but defensible claim.
 \begin{itemize}
   \item A residual MLP can be shaped to match the AMD XDNA~2 array very
         directly: one residual matrix per tile, streamed activations, explicit
         routing, and checkpoint-specific resident weights.
   \item That design already delivers multi-million-sample-per-second inference on
         a real collider-style dense benchmark using cheap consumer hardware.
-  \item The same codebase also reaches nontrivial full-data HIGGS quality,
+  \item The same design family also reaches nontrivial full-data HIGGS quality,
         culminating in 77.98\% test accuracy and 0.865 ROC AUC on the fixed
         500k-example test set.
 \end{itemize}
 
-Just as importantly, the branch now avoids claims it does not need. It does not
+Just as importantly, the paper avoids claims it does not need. It does not
 pretend the current model is a production trigger, that the current tail kernel
 is optimal, or that the current HIGGS result is the final word on tabular
 accuracy. The point is simpler and cleaner: spatial hardware rewards spatially
@@ -313,23 +309,32 @@ useful combination of interpretability, throughput, and real-task credibility.
 
 \section{Conclusion and next steps}
 
-The repository is now organized around one publishable message: designing a
-network for spatial compute on AMD XDNA~2 can produce unusually high throughput
-on real dense-event classification without turning the codebase into a maze of
-unrelated experiments. The paper branch therefore keeps only the residual-MLP
-training path, the HIGGS data path, the MLflow/Optuna sweep driver, and the
-forward-only streaming NPU deployment.
+The main result is straightforward: designing a network for spatial compute on
+AMD XDNA~2 can produce unusually high throughput on real dense-event
+classification while remaining simple enough to understand and validate end to
+end. The model family is deliberately modest, but it maps cleanly to the array
+and delivers both a strong throughput point and a nontrivial full-data HIGGS
+accuracy point.
 
 The next steps are correspondingly focused. The highest-leverage systems step is
 to move the $28 \rightarrow 32$ embed on-array so that the surrounding host work
 shrinks further. The highest-leverage modeling step is to continue exploiting
 the promising $H=64$, $L=32$ region with longer schedules and regularization,
-rather than broadening the scope of the branch again.
+rather than broadening the scope of the architecture prematurely.
+
+\section*{Disclosure of AI-assisted workflow}
+
+AI coding and research assistants, including Claude Opus 4.6, GPT-5.4, and
+Gemini 3.1 Pro, were used extensively during this project to generate code,
+propose experiments, summarize results, review literature, and critique or
+draft text. The author curated the research direction, selected the final
+claims and figures, verified the reported results, and takes responsibility for
+the content of this paper.
 
 \begin{thebibliography}{99}
 
 \bibitem{iron}
-AMD, \emph{IRON repository}.\newline
+AMD, \emph{IRON}.\newline
 \url{https://github.com/amd/IRON}
 
 \bibitem{mlir-aie}
