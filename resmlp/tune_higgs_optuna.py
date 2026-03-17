@@ -412,6 +412,31 @@ def enqueue_baselines(study, args):
         study.enqueue_trial(params, skip_if_exists=True)
 
 
+def write_study_snapshot(study, save_root, study_name):
+    study_dir = save_root / study_name
+    study_dir.mkdir(parents=True, exist_ok=True)
+    status = {
+        "study_name": study.study_name,
+        "n_trials": len(study.trials),
+        "completed_trials": sum(t.state == optuna.trial.TrialState.COMPLETE for t in study.trials),
+        "pruned_trials": sum(t.state == optuna.trial.TrialState.PRUNED for t in study.trials),
+        "failed_trials": sum(t.state == optuna.trial.TrialState.FAIL for t in study.trials),
+    }
+    (study_dir / "study_status.json").write_text(json.dumps(status, indent=2) + "\n")
+    completed = [trial for trial in study.trials if trial.state == optuna.trial.TrialState.COMPLETE]
+    if not completed:
+        return
+    best = study.best_trial
+    payload = {
+        "study_name": study.study_name,
+        "best_value": best.value,
+        "best_trial": best.number,
+        "best_params": best.params,
+        "best_user_attrs": best.user_attrs,
+    }
+    (study_dir / "best_trial.json").write_text(json.dumps(payload, indent=2) + "\n")
+
+
 def main():
     args = parse_args()
     tracking_dir, save_root = ensure_parent_dirs(args)
@@ -445,18 +470,17 @@ def main():
 
     objective = objective_factory(args, train_ds, val_ds, test_ds, device, save_root)
     timeout_seconds = None if args.timeout_hours <= 0 else int(math.ceil(args.timeout_hours * 3600))
-    study.optimize(objective, n_trials=args.n_trials, timeout=timeout_seconds, gc_after_trial=True)
-
-    best_payload = {
-        "study_name": args.study_name,
-        "best_value": study.best_value,
-        "best_trial": study.best_trial.number,
-        "best_params": study.best_trial.params,
-        "best_user_attrs": study.best_trial.user_attrs,
-    }
+    study.optimize(
+        objective,
+        n_trials=args.n_trials,
+        timeout=timeout_seconds,
+        gc_after_trial=True,
+        callbacks=[lambda study, trial: write_study_snapshot(study, save_root, args.study_name)],
+    )
+    write_study_snapshot(study, save_root, args.study_name)
     best_path = save_root / args.study_name / "best_trial.json"
-    best_path.write_text(json.dumps(best_payload, indent=2) + "\n")
-    print(json.dumps(best_payload, indent=2))
+    if best_path.exists():
+        print(best_path.read_text())
 
 
 if __name__ == "__main__":

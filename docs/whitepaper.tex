@@ -1407,6 +1407,7 @@ Model & Test acc. & ROC AUC & PR AUC & Log loss \\
 $H=32$, $L=8$ full-data (5 epochs) & 75.89\% & 0.8430 & 0.8559 & 0.4861 \\
 $H=32$, $L=32$ full-data (5 epochs) & 76.56\% & 0.8502 & 0.8628 & 0.4762 \\
 $H=32$, $L=32$ full-data (20-epoch schedule) & 76.98\% & 0.8542 & 0.8668 & 0.4705 \\
+Optuna best: $H=64$, $L=32$ (50e cap) & 77.98\% & 0.8653 & 0.8770 & 0.4543 \\
 \bottomrule
 \end{tabular}
 \caption{Full-data HIGGS results on the public \code{jxie/higgs} mirror. The
@@ -1414,7 +1415,8 @@ local cache uses the full published train/test splits (10.5M/500k rows);
 training holds out 100k examples for validation and fits on the remaining
 10.4M examples. The first two rows use the 5-epoch pilot recipe; the final row
 extends the 32-layer model to a clean 20-epoch cosine schedule and reports the
-best checkpoint from that longer run.}
+best checkpoint from that longer run. The last row is the best completed trial
+from an 8-hour Optuna/MLflow overnight sweep with a 50-epoch cap.}
 \label{tab:higgs-full-first}
 \end{table}
 
@@ -1424,13 +1426,16 @@ pilot now reaches 0.843 ROC AUC and 75.89\% accuracy on the fixed
 500k-example test set once it sees the full public training pool. The deeper
 32-layer model improves that further to 0.850 ROC AUC and 76.56\% accuracy in
 the 5-epoch pilot, and to 0.854 ROC AUC with 76.98\% accuracy once it is given
-a proper 20-epoch schedule. That longer run buys another 0.42 percentage
-points of test accuracy and about 0.004 ROC AUC beyond the already-strong
-5-epoch 32-layer point, which is a useful sign that the model was still
-undertrained rather than overfit. These are still not tuned
-state-of-the-art tabular numbers, but they are clearly no longer just
-synthetic-throughput props either: the resident-snake operating points remain
-genuine large-tabular classifiers once the data scale becomes realistic.
+a proper 20-epoch schedule. An overnight Optuna sweep then pushed the result
+again: the best completed trial moved to a wider $H=64$, $L=32$ model with
+batch size 4096, learning rate about $1.07\times10^{-3}$, weight decay about
+$3.23\times10^{-3}$, and mild label smoothing, reaching 0.865 ROC AUC,
+0.877 PR AUC, and 77.98\% accuracy on the fixed 500k-example test set. That is
+still not the final word on HIGGS, but it is a clear sign that the project is
+now competing in earnest on real large-tabular accuracy rather than only on a
+throughput narrative. The strongest trial also leaned into regularization
+rather than avoiding it, which is an encouraging hint that longer schedules and
+heavier weight decay are worth continuing to explore.
 
 Once that real-data check passed, the next obvious question was whether the tiny
 $32 \to 2$ classifier head should also move on-array. The answer is
