@@ -388,12 +388,12 @@ laptop CPU using both PyTorch and a decomposed NumPy path that mirrors the
 NPU's inference structure (separate embed, sequential residual body, head).
 
 \paragraph{Hardware and software.}
-The baseline machine is an Intel Core i7-8550U (4 cores / 8 threads, Kaby Lake
-Refresh, base 1.80~GHz, turbo up to 4.00~GHz) with 16~GB DDR4 RAM, running
-Linux 6.8. PyTorch 2.11.0 uses 4 intra-op threads (the physical core count);
-NumPy 2.4.4 is backed by OpenBLAS 0.3.31 with the same default thread pool.
-No explicit thread pinning or frequency governor tuning was applied; the
-measurements reflect the default out-of-the-box laptop configuration.
+The baseline machine is the same AMD Ryzen AI 9 HX 370 (12 cores / 24 threads,
+max 5.16~GHz) used for all NPU measurements, running Linux 6.17. PyTorch
+2.10.0 uses 12 intra-op threads (the physical core count); NumPy 1.26.4 is
+backed by OpenBLAS with the same default thread pool. No explicit thread pinning
+or frequency governor tuning was applied; the measurements reflect the default
+out-of-the-box configuration.
 
 \paragraph{Methodology.}
 Each benchmark processes 5M samples using random \code{float32} inputs of the
@@ -411,50 +411,47 @@ through $B=1024$ to show how CPU throughput scales with batch-level parallelism.
 \toprule
 Configuration & Batch size & PyTorch CPU & NumPy decomposed \\
 \midrule
-$H=32$, $L=8$ (speed) & $B=8$ & 42k samples/s & 150k samples/s \\
-$H=32$, $L=8$ (speed) & $B=256$ & 764k samples/s & 726k samples/s \\
-$H=32$, $L=8$ (speed) & $B=1024$ & 1.76M samples/s & 1.06M samples/s \\
+$H=32$, $L=8$ (speed) & $B=8$ & 104k samples/s & 491k samples/s \\
+$H=32$, $L=8$ (speed) & $B=256$ & 1.82M samples/s & 3.41M samples/s \\
+$H=32$, $L=8$ (speed) & $B=1024$ & 3.27M samples/s & 1.73M samples/s \\
 \midrule
-$H=64$, $L=32$ (accuracy) & $B=8$ & 12k samples/s & 29k samples/s \\
-$H=64$, $L=32$ (accuracy) & $B=256$ & 170k samples/s & 126k samples/s \\
-$H=64$, $L=32$ (accuracy) & $B=1024$ & 339k samples/s & 116k samples/s \\
+$H=64$, $L=32$ (accuracy) & $B=8$ & 28k samples/s & 105k samples/s \\
+$H=64$, $L=32$ (accuracy) & $B=256$ & 352k samples/s & 197k samples/s \\
+$H=64$, $L=32$ (accuracy) & $B=1024$ & 598k samples/s & 234k samples/s \\
 \bottomrule
 \end{tabular}
 \caption{CPU throughput baseline for the same model architectures, measured on
-an Intel i7-8550U laptop (4 cores, 16 GB DDR4). PyTorch uses 4 intra-op
-threads; NumPy uses OpenBLAS with default threading. All runs process 5M
-samples with random \code{float32} inputs.}
+the AMD Ryzen AI 9 HX 370 host (12 cores) used for all NPU experiments. PyTorch
+uses 12 intra-op threads; NumPy uses OpenBLAS with default threading. All runs
+process 5M samples with random \code{float32} inputs.}
 \label{tab:cpu-baseline}
 \end{table}
 
 Several patterns are worth noting. First, the CPU strongly favors large batch
-sizes: PyTorch throughput on the speed variant improves by $42\times$ going from
-$B=8$ to $B=1024$, because larger batches amortize per-call dispatch overhead
-and expose enough work for BLAS multi-threading. At $B=8$, the 32$\times$32
-matmuls are too small for OpenBLAS to distribute across cores, and PyTorch's
-autograd dispatch adds measurable per-layer overhead; at $B=1024$, OpenBLAS
-achieves roughly $2.6\times$ scaling across 4 threads on the same matmul.
-Second, the NumPy decomposed path is faster than PyTorch at small batch sizes
-(lower per-call overhead from avoiding the framework dispatch) but slower at
-large batch sizes where PyTorch's fused ATen kernels and internal parallelism
-pay off.
+sizes: PyTorch throughput on the speed variant improves by $\sim31\times$ going
+from $B=8$ to $B=1024$, because larger batches amortize per-call dispatch
+overhead and expose enough work for BLAS multi-threading. At $B=8$, the
+$32\times32$ matmuls are too small for OpenBLAS to distribute across cores, and
+PyTorch's per-layer dispatch adds measurable overhead; at larger batch sizes,
+OpenBLAS saturates the 12 available threads and PyTorch's fused ATen kernels
+pay off. Second, the NumPy decomposed path is faster than PyTorch at small batch
+sizes (lower per-call overhead) but slower at large batch sizes where PyTorch's
+internal parallelism dominates.
 
 Third, and most relevant to the NPU comparison: at the NPU's native streaming
-batch size of $B=8$, the CPU reaches only 42k samples/s (PyTorch) for the
-speed variant---roughly $100\times$ slower than the NPU's 4.18M~samples/s
+batch size of $B=8$, the CPU reaches only 104k~samples/s (PyTorch) for the
+speed variant---roughly $40\times$ slower than the NPU's 4.18M~samples/s
 wall-clock throughput. Even at the CPU's best batch size ($B=1024$), the peak
-of 1.76M samples/s is still $2.4\times$ below the NPU's wall-clock result and
-$15\times$ below its kernel throughput. For the accuracy variant ($H=64$,
-$L=32$), the gap is larger: the CPU peaks at 339k~samples/s versus the NPU's
-1.35M~samples/s wall-clock, a $4\times$ advantage.
+of 3.27M samples/s is still $1.3\times$ below the NPU's wall-clock result and
+$8\times$ below its kernel throughput. For the accuracy variant ($H=64$,
+$L=32$), the gap is larger: the CPU peaks at 598k~samples/s versus the NPU's
+1.35M~samples/s wall-clock, a $2.3\times$ advantage.
 
-\paragraph{Caveat.}
-This baseline was measured on a different machine (Intel i7-8550U laptop) than
-the NPU throughput results (AMD Ryzen AI 9 HX 370). The comparison is
-therefore indicative rather than controlled. A same-host CPU baseline on the
-Ryzen AI machine would provide a tighter bound; we expect the Zen~5 cores to
-be faster than this Kaby Lake part, which would narrow the gap somewhat but
-not close it at $B=8$.
+\paragraph{Note.}
+Both the CPU baseline and the NPU throughput measurements were obtained on the
+same AMD Ryzen AI 9 HX 370 host, making the comparison controlled: the two
+results share the same memory subsystem, OS, and software stack, differing only
+in whether the residual body runs on the host cores or the on-die NPU array.
 
 \section{Discussion}
 
