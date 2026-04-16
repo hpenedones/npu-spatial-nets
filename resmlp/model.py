@@ -38,13 +38,13 @@ class ResidualLinear(nn.Module):
 
 
 class ResMLP(nn.Module):
-    """Residual MLP for image classification.
+    """Residual MLP for dense tabular classification (e.g. HIGGS).
 
     Args:
         hidden_dim: Width of all hidden layers (must match NPU tile dimension).
         num_layers: Number of residual layers (must match number of NPU tiles).
         num_classes: Number of output classes.
-        input_dim: Flattened input feature dimension.
+        input_dim: Input feature dimension (e.g. 28 for native HIGGS features).
     """
 
     def __init__(self, hidden_dim=160, num_layers=32,

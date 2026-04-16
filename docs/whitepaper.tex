@@ -92,12 +92,16 @@ latency sensitivity, and pressure for very high sustained throughput.
 This places the paper next to three adjacent literatures. For HIGGS itself, the
 reference landscape already includes both the original deep-versus-classic
 baseline framing and the strong tabular baselines now typically led by boosted
-tree ensembles \cite{baldi-higgs,xgboost-kdd,lightgbm-nips,catboost-paper,rtdl-revisiting,grinsztajn-tabular}. For
+tree ensembles \cite{baldi-higgs,xgboost-kdd,lightgbm-nips,catboost-paper,rtdl-revisiting,grinsztajn-tabular}; attention-based and decision-tree-hybrid deep tabular methods such as TabNet and NODE have also been evaluated on this benchmark \cite{tabnet,node-paper}. Comprehensive surveys of machine learning for particle physics provide broader context for where such dense-event classification sits within the HEP community \cite{ml4hep-review}. For
 low-latency collider inference, substantial prior work has targeted FPGA-based
-trigger deployments and related co-design flows \cite{duarte-fpga,cms-phase2-l1}. At
+trigger deployments and related co-design flows; the hls4ml open codesign
+toolchain makes the path from a trained model to firmware particularly direct
+\cite{duarte-fpga,hls4ml,cms-phase2-l1}. At
 the accelerator level, the closest precedent is the spatial/dataflow tradition,
 where local SRAM and explicit movement constrain the network shape as much as
-raw arithmetic throughput does \cite{dadiannao,eyeriss}. The claim here is
+raw arithmetic throughput does; purpose-built DNN accelerators and the Google
+TPU family both illustrate how data movement can become the primary design
+constraint rather than arithmetic throughput \cite{dadiannao,eyeriss,tpu-isca17}. The claim here is
 narrower: given an existing benchmark, existing consumer NPU hardware, and an
 existing compiler/runtime stack, what is the simplest residual design that maps
 cleanly enough to the array to make a credible end-to-end systems case?
@@ -126,7 +130,7 @@ the deeper $L=32$ body occupies the full 8-column array.}
 Property & Why it matters here \\
 \midrule
 32 compute tiles (8 columns $\times$ 4 rows) & Depth maps naturally to tile count; an $L=8$ body uses 2 columns, an $L=32$ body uses the full array. \\
-About 64 KB local SRAM per compute tile & Parameters must stay small enough to live locally; that strongly constrains hidden width. \\
+About 64 KB local SRAM per compute tile \cite{amd-aie,amd-npu-linux} & Parameters must stay small enough to live locally; that strongly constrains hidden width. \\
 8$\times$8 MMUL-friendly blocked execution & Widths and batch sizes should be divisible by 8, and host-side packing must respect tiled layouts. \\
 Explicit FIFOs, DMA, and routing & Data movement is part of the design, not an afterthought hidden behind a cache hierarchy. \\
 IRON / MLIR-AIE / XRT software stack & The implementation programs the array close to the hardware model rather than through a high-level opaque runtime. \\
@@ -162,7 +166,8 @@ $H \times H$ weights).
   h_{\ell+1} = \mathrm{ReLU}(h_{\ell} W_{\ell}) + h_{\ell},
   \qquad \ell = 0,\dots,L-1.
 \]
-Each residual matrix $W_{\ell}$ is assigned to one compute tile. Activations
+The skip connection follows the convention introduced by He et al.~\cite{he-resnet};
+each residual matrix $W_{\ell}$ is assigned to one compute tile. Activations
 enter the array, flow through the tiles in a snake, and return to the host only
 after the full hidden body has completed. In the current deployment path:
 \begin{itemize}
@@ -239,10 +244,13 @@ already-selected models.
 
 HIGGS is also a good benchmark because it sits at the intersection of two real
 literatures. In high-energy physics it is a canonical dense-event benchmark
-\cite{baldi-higgs}. In tabular machine learning it is one of the standard
+\cite{baldi-higgs}, situated within a broader programme of applying machine
+learning to particle-physics classification and reconstruction that is
+surveyed in \cite{ml4hep-review}. In tabular machine learning it is one of the standard
 large-data problems on which tree ensembles such as XGBoost, LightGBM, and
-CatBoost remain strong baselines, while modern deep tabular models are now more
-competitive but not universally dominant \cite{xgboost-kdd,lightgbm-nips,catboost-paper,rtdl-revisiting,grinsztajn-tabular}.
+CatBoost remain strong baselines, while modern deep tabular models---including
+attention-based and decision-tree-hybrid approaches---are now more
+competitive but not universally dominant \cite{xgboost-kdd,lightgbm-nips,catboost-paper,rtdl-revisiting,grinsztajn-tabular,tabnet,node-paper}.
 That means the relevant bar is not ``beat every HIGGS leaderboard'', but
 ``land in a statistically credible part of the baseline landscape while
 preserving a deployment shape the NPU can actually exploit''. Good-enough
@@ -342,7 +350,6 @@ This table sharpens the systems conclusion. The best current wall-clock point
 is not the deepest model, and it is not the version with the entire graph moved
 onto the array. The tuned $H=64$, $L=32$ checkpoint now runs cleanly on
 hardware, but it lands at only 1.35M samples/s wall-clock, so the additional
-width extends the accuracy frontier rather than the throughput frontier. On the
 width extends the accuracy frontier rather than the throughput frontier.
 
 On the present tail kernel, the fused $H \rightarrow 2$ NPU head is slower than
@@ -631,6 +638,36 @@ Learning Models for Tabular Data}.\newline
 L. Grinsztajn, E. Oyallon, and G. Varoquaux, \emph{Why do tree-based models
 still outperform deep learning on tabular data?}.\newline
 \url{https://arxiv.org/abs/2207.08815}
+
+\bibitem{he-resnet}
+K. He, X. Zhang, S. Ren, and J. Sun, \emph{Deep Residual Learning for Image
+Recognition}, CVPR 2016.\newline
+\url{https://arxiv.org/abs/1512.03385}
+
+\bibitem{hls4ml}
+J. Duarte et al., \emph{hls4ml: An Open-Source Codesign Workflow to Empower
+Scientific Low-Power Machine Learning Devices}, Front.\ Big Data 4, 2021.\newline
+\url{https://doi.org/10.3389/fdata.2021.604443}
+
+\bibitem{tpu-isca17}
+N.~P. Jouppi et al., \emph{In-Datacenter Performance Analysis of a Tensor
+Processing Unit}, ISCA 2017.\newline
+\url{https://arxiv.org/abs/1704.04760}
+
+\bibitem{tabnet}
+S.~\"{O}. Arik and T. Pfister, \emph{TabNet: Attentive Interpretable Tabular
+Learning}, AAAI 2021.\newline
+\url{https://arxiv.org/abs/1908.07442}
+
+\bibitem{node-paper}
+S. Popov, S. Morozov, and A. Babenko, \emph{Neural Oblivious Decision Ensembles
+for Deep Learning on Tabular Data}, ICLR 2020.\newline
+\url{https://arxiv.org/abs/1909.06312}
+
+\bibitem{ml4hep-review}
+M. Feickert and B. Nachman, \emph{A Living Review of Machine Learning for
+Particle Physics}, 2021.\newline
+\url{https://arxiv.org/abs/2102.02770}
 
 \end{thebibliography}
 
