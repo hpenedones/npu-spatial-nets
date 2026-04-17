@@ -45,7 +45,7 @@ matches the AMD XDNA~2 NPU for high-throughput, low-latency inference on dense
 collider-style features? We answer it with a forward-only residual MLP whose
 hidden body streams across the 32 compute tiles of the Strix Point array. On
 the public HIGGS benchmark, we retain two key configurations: a speed-optimized
-$H=32$, $L=8$ model that sustains about 4.18M samples/s wall-clock with the
+$H=32$, $L=8$ model that sustains about 2.38M samples/s wall-clock with the
 tiny classifier head left on CPU, and a full-data $H=64$, $L=32$ model trained
 on 10.4M examples that reaches 77.98\% test accuracy, 0.865 ROC AUC, and 0.877
 PR AUC on the fixed 500k-example test split. The design is small enough to
@@ -84,7 +84,7 @@ decisions with a latency budget of about 12.5~$\mu$s, and emit accepted events
 at roughly 750~kHz \cite{cms-phase2-l1}. Those rates explain why
 multi-megasample-per-second measurements are interesting here, but they are not
 used to imply deployment equivalence: the best wall-clock repeated-sample
-result in this paper is 4.18M samples/s, above the accepted-event rate yet far
+result in this paper is 2.38M samples/s, above the accepted-event rate yet far
 below the full bunch-crossing stream, on a simpler host-assisted prototype.
 The point is to study the same general systems regime of dense features, strict
 latency sensitivity, and pressure for very high sustained throughput.
@@ -321,63 +321,80 @@ accuracy-indifferent.
 
 \subsection{Throughput of the spatial-streaming deployment}
 
-Table~\ref{tab:higgs-throughput} reports the current repeated-sample throughput
-measurements over 50M processed samples. ``Wall throughput'' includes the host
-input projection, host head, host-visible runtime overheads, and the NPU
-residual stage. ``Kernel throughput'' counts only the NPU kernel wait time.
+Table~\ref{tab:higgs-throughput} reports repeated-sample throughput measurements
+over 50M processed samples on the retained HIGGS checkpoints. ``Wall
+throughput'' is end-to-end, including the host input projection, host head, all
+host-visible runtime overheads, and the NPU residual stage; ``kernel
+throughput'' counts only NPU kernel wait time. The ``sync'' column is the naive
+serial host loop used in earlier revisions of this work; the ``async'' column
+uses the double-buffered host/kernel overlap described in
+\S\ref{sec:pipeline-overlap} below.
 
 \begin{table}[t]
 \centering
 \small
-\begin{tabular}{@{}llrr@{}}
+\begin{tabular}{@{}lrrrr@{}}
 \toprule
-Configuration & Head placement & Wall throughput & Kernel throughput \\
+Configuration & \multicolumn{2}{c}{Wall throughput} & Kernel throughput & Wall/kernel \\
+\cmidrule(lr){2-3}
+ & sync & async & & (async) \\
 \midrule
-$H=32$, $L=8$, 2 columns & CPU head & 4.18M samples/s & 26.29M samples/s \\
-$H=32$, $L=8$, 2 columns & NPU head & 3.65M samples/s & 7.47M samples/s \\
-$H=32$, $L=32$, 8 columns & CPU head & 3.49M samples/s & 19.06M samples/s \\
-$H=32$, $L=32$, 8 columns & NPU head & 3.15M samples/s & 6.68M samples/s \\
-$H=64$, $L=32$, 8 columns & CPU head & 1.35M samples/s & 3.05M samples/s \\
+$H=32$, $L=8$, 2 columns  & 1.74M & 2.38M & 2.40M & 99\% \\
+$H=32$, $L=32$, 8 columns & 1.79M & 2.35M & 2.37M & 99\% \\
+$H=64$, $L=32$, 8 columns & 0.86M & 1.53M & 1.54M & 99\% \\
 \bottomrule
 \end{tabular}
-\caption{Repeated-sample throughput on the retained HIGGS checkpoints. The
-fastest wall-clock path is the 8-layer, 2-column variant with the classifier
-head left on CPU; the current fused on-array head is slower.}
+\caption{Repeated-sample throughput on the retained HIGGS checkpoints.
+``Sync'' and ``async'' refer to the host-loop implementation; both use the same
+NPU bitstream. With the async host loop, wall-clock throughput tracks the NPU
+kernel ceiling to within 1\%, so further host-side optimization cannot buy
+additional throughput; any future gains have to come from making the NPU
+kernel itself faster.}
 \label{tab:higgs-throughput}
 \end{table}
 
-This table sharpens the systems conclusion. The best current wall-clock point
-is not the deepest model, and it is not the version with the entire graph moved
-onto the array. The tuned $H=64$, $L=32$ checkpoint now runs cleanly on
-hardware, but it lands at only 1.35M samples/s wall-clock, so the additional
-width extends the accuracy frontier rather than the throughput frontier.
+\subsubsection{Closing the wall/kernel gap with a double-buffered host loop}
+\label{sec:pipeline-overlap}
 
-On the present tail kernel, the fused $H \rightarrow 2$ NPU head is slower than
-keeping that tiny classifier on CPU. That is an important honest result: the
-fastest measured path is not yet a fully on-array pipeline, and the right
-abstraction boundary in the current implementation is a CPU input projection,
-NPU residual body, and CPU head. The next hardware step is therefore not
-``force everything on-array'' but ``move the surrounding stages only when they
-actually improve wall time''. A plausible reason is that the $H \rightarrow 2$
-head is simply too small to amortize the extra synchronization, buffer traffic,
-and launch overheads of the fused tail path. In other words, the added runtime
-machinery costs more than the CPU work it removes.
+Earlier revisions of this paper reported that wall throughput was several times
+lower than kernel throughput for every configuration. Instrumenting the host
+loop showed that the gap was dominated by Python per-call overhead: the
+$H=64$, $L=32$ configuration spent roughly 380~\textmu{}s/call on the CPU
+input projection, 64~\textmu{}s/call tiling the activations, 78~\textmu{}s/call
+detiling outputs, and 71~\textmu{}s/call on the CPU head, against only
+156~\textmu{}s/call in kernel wait. Two changes eliminate this gap without
+changing the NPU kernel or the network itself. First, we replaced 32 small
+Python dispatches per kernel invocation with four stacked numpy operations
+(one embed matmul on all $S \!\times\! B$ rows, one reshape/transpose pack, one
+reshape/transpose detile, one head matmul), which collapses the host work
+from ${\sim}590$\,\textmu{}s/call to ${\sim}120$\,\textmu{}s/call. Second, we
+use two-slot ping-pong device buffers and dispatch the next kernel with
+\texttt{run = xrt\_kernel(\dots{})} before the host begins consuming the
+previous slot's output, so wall time becomes $\max(\text{host},\text{kernel})$
+instead of $\text{host}+\text{kernel}$.
+
+For all three configurations the kernel is now the bottleneck and wall
+throughput tracks it to within 1\%. The speed variant's wall throughput rose
+from 1.74M to 2.38M samples/s ($+37\%$); the accuracy variant's from 0.86M to
+1.53M samples/s ($+78\%$). These numbers also sharpen the scope of the
+remaining ``NPU-native'' question: because host work already runs fully
+concealed by the kernel, moving the input projection or the $H \rightarrow 2$
+head onto the array cannot shorten wall time, and would only help if the new
+pipeline had strictly lower kernel time than today's residual-only body.
 
 Figure~\ref{fig:accuracy-throughput-frontier} combines the retained full-data
-accuracy rows with the measured CPU-head wall-throughput rows. It makes the
+accuracy rows with the measured async wall-throughput rows. It makes the
 trade-off explicit: $H=32$, $L=8$ is the wall-clock leader, $H=32$, $L=32$
 trades some speed for better accuracy, and the tuned $H=64$, $L=32$ run
-remains the accuracy ceiling, but at 1.35M samples/s wall-clock it sits well
-left of the two $H=32$ variants.
+remains the accuracy ceiling, but at 1.53M samples/s wall-clock it sits
+below the two $H=32$ variants.
 
 \begin{figure}[t]
 \centering
 \includegraphics[width=\textwidth]{accuracy_throughput_frontier.pdf}
 \caption{Accuracy-throughput frontier for the retained HIGGS/XDNA~2 variants.
-X-axis: test accuracy; Y-axis: wall-clock throughput in M samples/s. The three
-plotted throughput measurements use the CPU-head rows from
-Table~\ref{tab:higgs-throughput}, including the tuned $H=64$, $L=32$
-checkpoint.}
+X-axis: test accuracy; Y-axis: wall-clock throughput in M samples/s. Throughput
+is the async/double-buffered measurement from Table~\ref{tab:higgs-throughput}.}
 \label{fig:accuracy-throughput-frontier}
 \end{figure}
 
@@ -440,12 +457,14 @@ internal parallelism dominates.
 
 Third, and most relevant to the NPU comparison: at the NPU's native streaming
 batch size of $B=8$, the CPU reaches only 104k~samples/s (PyTorch) for the
-speed variant---roughly $40\times$ slower than the NPU's 4.18M~samples/s
+speed variant---roughly $23\times$ slower than the NPU's 2.38M~samples/s
 wall-clock throughput. Even at the CPU's best batch size ($B=1024$), the peak
-of 3.27M samples/s is still $1.3\times$ below the NPU's wall-clock result and
-$8\times$ below its kernel throughput. For the accuracy variant ($H=64$,
-$L=32$), the gap is larger: the CPU peaks at 598k~samples/s versus the NPU's
-1.35M~samples/s wall-clock, a $2.3\times$ advantage.
+of 3.27M samples/s is still $1.4\times$ above the NPU's wall-clock result for
+the speed variant: with a fully pipelined BLAS path and large batches, the
+12-core CPU edges out the 2-column $L=8$ body on this particular configuration.
+For the accuracy variant ($H=64$, $L=32$), the NPU retains a clear advantage:
+the CPU peaks at 598k~samples/s versus the NPU's 1.53M~samples/s wall-clock,
+a $2.6\times$ factor.
 
 \paragraph{Note.}
 Both the CPU baseline and the NPU throughput measurements were obtained on the
@@ -515,16 +534,24 @@ HIGGS result.
 What exists today is a measured host-assisted prototype; fully on-array
 ingress/egress and energy-efficiency characterization remain future work.
 
-The next steps are correspondingly focused. The highest-leverage systems step is
-still to move the $28 \rightarrow 32$ input projection on-array so that the surrounding
-host work shrinks further, but that should be understood mainly as an
-alignment/runtime clean-up rather than as a fix for a tile-SRAM shortfall. The
-SRAM-sensitive scaling question is different: wider hidden bodies will require
-revisiting the first-tile ingress layout because that tile reaches the 64~KB
-ceiling before the internal tiles do. The highest-leverage modeling step is to
-continue exploiting the promising $H=64$, $L=32$ region with longer schedules
-and regularization, rather than broadening the scope of the architecture
-prematurely.
+The next steps are correspondingly focused. Because the double-buffered host
+loop (\S\ref{sec:pipeline-overlap}) already conceals all CPU embed, pack,
+detile, and head work behind the kernel, wall-clock throughput now tracks the
+NPU kernel ceiling to within 1\% and further host-side optimization cannot buy
+additional throughput. Moving the $28 \rightarrow 32$ input projection or the
+$H \rightarrow 2$ head on-array is therefore no longer a wall-time fix; it is
+only a worthwhile systems step if the resulting fully on-array pipeline has
+strictly lower kernel time than today's residual-only body, which seems
+unlikely on this configuration. The more productive direction is making the
+NPU kernel itself faster: increasing stream depth up to the per-DMA descriptor
+limit, overlapping the D2H of one chunk with the H2D of the next, or
+revisiting the MMUL tiling so that more compute is packed into each kernel
+invocation. The SRAM-sensitive scaling question is different: wider hidden
+bodies will require revisiting the first-tile ingress layout because that tile
+reaches the 64~KB ceiling before the internal tiles do. The highest-leverage
+modeling step is to continue exploiting the promising $H=64$, $L=32$ region
+with longer schedules and regularization, rather than broadening the scope of
+the architecture prematurely.
 
 \clearpage
 \appendix

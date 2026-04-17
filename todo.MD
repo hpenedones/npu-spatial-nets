@@ -20,6 +20,12 @@ so that we can address them in the paper.
 
   - The "Mean" Critique: "The NPU is merely a co-processor here; the paper fails to demonstrate a truly standalone spatial dataflow pipeline."
 
+  - Partial response: with the double-buffered host/kernel overlap (§5.2)
+    host embed/head/tile/detile work runs fully concealed behind the kernel,
+    so the CPU-assisted path is not actually on the critical wall-time path.
+    Moving embed/head on-array remains desirable for the "NPU-native"
+    narrative but is no longer a wall-throughput fix.
+
 3. Limited Architectural Diversity - A reviewer looking for "ML novelty" might find the residual MLP too simple.
 
   - The Argument: "The 'conveyor-belt' mapping is specific to a very narrow class of sequential residual MLPs. The paper does not demonstrate how this approach scales to more complex topologies used in modern jet tagging, such as Graph Neural Networks (GNNs) or Attention mechanisms, which are the primary interest of the ML4Jets community." 
@@ -40,6 +46,25 @@ so that we can address them in the paper.
 
 6 - No results for 16 layer MLP
 
-  The Argument: "You only show results for the 8 and 32 layer MLPs. Why not show results for the 16 layer MLP?" 
+  The Argument: "You only show results for the 8 and 32 layer MLPs. Why not show results for the 16 layer MLP?"     
 
   - The "Mean" Critique: "you didn't fully explore the design space"
+
+7 - Gap with kernel throughput  [ADDRESSED §5.2]
+
+  The Argument: "The paper claims a 'NPU-native' design, yet there seems to be a gap between the kernel throughput and the wall time throughput. How can you justify this gap? And how could you close it? If you could achieve 30M samples/s on the kernel, why not 30M samples/s on the wall time?"
+
+  - The "Mean" Critique: "you have bottlenecked the NPU with a suboptimal software implementation"
+
+  - Status: resolved by the stacked-host + double-buffered pipeline (see
+    `resmlp/streaming_infer.py` and `resmlp/streaming_op.py`). Wall throughput
+    now tracks kernel throughput to within 1\% on all three retained
+    configurations; Table 4 and §5.2 report both sync and async columns for
+    the comparison.
+
+8 - Comparison with the FPGA recent paper
+
+  - The argument: The paper " Development and demonstration of the CMS Phase-2
+Level-1 trigger Data Scouting baseline system for HL-LHC" available at https://inspirehep.net/files/1a1f1ae803ff794879636eb00f8d7e7b seems to describe the state of the art in FPGA based L1 trigger.  How do you compare?
+
+  - The "Mean" Critique: "you are not comparing with the state of the art"

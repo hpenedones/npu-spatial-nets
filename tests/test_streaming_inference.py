@@ -98,9 +98,9 @@ def run_test(H=32, B=8, cols=2, stream_depth=1, scale=0.01):
         ((inputs_round1, refs_round1), (inputs_round2, refs_round2)),
         start=1,
     ):
-        op.write_buffer("input", np.concatenate([to_tiled(x) for x in inputs_group]))
-        op.run_stream()
-        y_flat = op.read_buffer("output", (stream_depth * B * H,), copy=True)
+        op.write_input_slot(0, np.concatenate([to_tiled(x) for x in inputs_group]))
+        op.run_stream(slot=0)
+        y_flat = op.read_output_slot(0, (stream_depth * B * H,), copy=True)
 
         for batch_idx, ref in enumerate(refs_group):
             start = batch_idx * B * H

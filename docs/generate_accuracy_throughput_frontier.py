@@ -29,7 +29,6 @@ class ThroughputRow:
     configuration: str
     hidden_dim: int
     num_layers: int
-    head_placement: str
     wall_mps: float
     kernel_mps: float
 
@@ -74,6 +73,11 @@ def parse_accuracy_rows(tex: str) -> list[AccuracyRow]:
         parts = [part.strip() for part in clean.split("&")]
         if len(parts) != 5:
             continue
+        # Accuracy rows have the percent sign in column 1 (e.g. "76.56\%");
+        # throughput rows put the percent sign in the final column. Skip anything
+        # whose second cell is not a percentage.
+        if r"\%" not in parts[1]:
+            continue
         model = parts[0]
         match = re.search(r"H=(\d+).+L=(\d+)", model)
         if not match:
@@ -93,28 +97,37 @@ def parse_accuracy_rows(tex: str) -> list[AccuracyRow]:
 
 
 def parse_throughput_rows(tex: str) -> list[ThroughputRow]:
+    """Parse rows from the async/sync throughput table.
+
+    Expected row shape (5 ampersand-separated cells):
+      configuration & sync-wall & async-wall & kernel & wall/kernel
+    e.g. `$H=32$, $L=8$, 2 columns  & 1.74M & 2.38M & 2.40M & 99\\%`
+    """
     rows: list[ThroughputRow] = []
+    num_re = re.compile(r"([\d.]+)M")
     for raw_line in tex.splitlines():
         line = raw_line.strip()
-        if "samples/s" not in line or "$H=" not in line or "&" not in line:
+        if "$H=" not in line or "&" not in line or "M" not in line:
             continue
         clean = strip_table_row(line)
         parts = [part.strip() for part in clean.split("&")]
-        if len(parts) != 4:
+        if len(parts) != 5:
             continue
         configuration = parts[0]
-        head_placement = parts[1]
         match = re.search(r"H=(\d+).+L=(\d+)", configuration)
         if not match:
+            continue
+        async_wall = num_re.search(parts[2])
+        kernel = num_re.search(parts[3])
+        if async_wall is None or kernel is None:
             continue
         rows.append(
             ThroughputRow(
                 configuration=configuration,
                 hidden_dim=int(match.group(1)),
                 num_layers=int(match.group(2)),
-                head_placement=head_placement,
-                wall_mps=float(parts[2].replace("M samples/s", "")),
-                kernel_mps=float(parts[3].replace("M samples/s", "")),
+                wall_mps=float(async_wall.group(1)),
+                kernel_mps=float(kernel.group(1)),
             )
         )
     return rows
@@ -136,17 +149,13 @@ def find_accuracy(
 
 
 def find_throughput(
-    rows: list[ThroughputRow], hidden_dim: int, num_layers: int, head_placement: str
+    rows: list[ThroughputRow], hidden_dim: int, num_layers: int
 ) -> ThroughputRow:
     for row in rows:
-        if (
-            row.hidden_dim == hidden_dim
-            and row.num_layers == num_layers
-            and row.head_placement == head_placement
-        ):
+        if row.hidden_dim == hidden_dim and row.num_layers == num_layers:
             return row
     raise ValueError(
-        f"Could not find throughput row for H={hidden_dim}, L={num_layers}, {head_placement!r}"
+        f"Could not find throughput row for H={hidden_dim}, L={num_layers}"
     )
 
 
@@ -447,15 +456,15 @@ def main() -> int:
 
     throughput_point = (
         find_accuracy(accuracy_rows, 32, 8, "full-data (5 epochs)"),
-        find_throughput(throughput_rows, 32, 8, "CPU head"),
+        find_throughput(throughput_rows, 32, 8),
     )
     manual_point = (
         find_accuracy(accuracy_rows, 32, 32, "full-data (20 epochs)"),
-        find_throughput(throughput_rows, 32, 32, "CPU head"),
+        find_throughput(throughput_rows, 32, 32),
     )
     best_accuracy = (
         find_accuracy(accuracy_rows, 64, 32, "Validation-selected tuning run"),
-        find_throughput(throughput_rows, 64, 32, "CPU head"),
+        find_throughput(throughput_rows, 64, 32),
     )
 
     svg = render_svg(throughput_point, manual_point, best_accuracy)

@@ -14,8 +14,9 @@ from resmlp.xrt_env import ensure_xrt_python_path
 ensure_xrt_python_path()
 
 from iron.common.aie_context import AIEContext
+from iron.common.aie_device_manager import pyxrt
 
-from resmlp import from_tiled, to_tiled
+from resmlp import TILE_BLOCK, from_tiled, to_tiled
 from resmlp.data_utils import DEFAULT_SPLIT_SEED, DEFAULT_VAL_SIZE, get_eval_dataset
 from resmlp.design import ROWS_PER_COL
 from resmlp.model import ResMLP
@@ -86,15 +87,14 @@ class HiggsStreamingInferenceService:
         self.model.load_state_dict(ckpt["model"])
         self.model.eval()
 
-        self.embed_weight = self.model.embed.weight.detach().float()
-        self.embed_bias = self.model.embed.bias.detach().float()
+        self.embed_weight_np = self.model.embed.weight.detach().cpu().float().numpy()
+        self.embed_bias_np = self.model.embed.bias.detach().cpu().float().numpy()
         residual_weights = self.model.export_residual_weights()
         self.packed_weights_by_tile = np.stack(
             [np.asarray(to_tiled(weight), dtype=bfloat16) for weight in residual_weights]
         )
         self.cpu_head_weight = self.model.head.weight.detach().cpu().float().numpy()
         self.cpu_head_bias = self.model.head.bias.detach().cpu().float().numpy()
-        self.zero_hidden = np.zeros((self.B, self.hidden_dim), dtype=bfloat16)
 
         ctx = AIEContext(use_runlist=False)
         self.npu_op = StreamingResMLP(
@@ -108,40 +108,159 @@ class HiggsStreamingInferenceService:
         ctx.compile_all()
         ctx.prepare_runtime()
 
-    def _embed_batch(self, features):
-        flat = features.view(self.B, -1).float()
-        hidden = (flat @ self.embed_weight.T + self.embed_bias).numpy()
-        return hidden.astype(bfloat16)
+    def _embed_stacked(self, features_SBD):
+        """(S, B, D) float32 → (S, B, H) bf16 via a single (S*B, D)·(D, H) matmul."""
+        S = self.stream_depth
+        flat = features_SBD.reshape(S * self.B, self.input_dim)
+        hidden = flat @ self.embed_weight_np.T + self.embed_bias_np
+        return hidden.astype(bfloat16).reshape(S, self.B, self.hidden_dim)
 
-    def _pad_and_pack_hidden(self, hidden_batches):
-        valid = len(hidden_batches)
-        hidden_tiles = [to_tiled(batch.astype(bfloat16, copy=False)) for batch in hidden_batches]
-        while len(hidden_tiles) < self.stream_depth:
-            hidden_tiles.append(to_tiled(self.zero_hidden))
-        return np.concatenate(hidden_tiles), valid
+    def _pack_stacked(self, hidden_SBH):
+        """(S, B, H) bf16 → flat tiled buffer, shape (S*B*H,). Single reshape+transpose."""
+        br = bc = TILE_BLOCK
+        S, B, H = hidden_SBH.shape
+        return (
+            hidden_SBH.reshape(S, B // br, br, H // bc, bc)
+            .transpose(0, 1, 3, 2, 4)
+            .reshape(-1)
+        )
 
-    def process_hidden_chunk(self, hidden_batches):
-        if not hidden_batches:
-            return [], 0.0
+    def _detile_stacked(self, flat_SBH):
+        """(S*B*H,) tiled bf16 → (S, B, H) float32. Single reshape+transpose."""
+        br = bc = TILE_BLOCK
+        S, B, H = self.stream_depth, self.B, self.hidden_dim
+        return (
+            flat_SBH.reshape(S, B // br, H // bc, br, bc)
+            .transpose(0, 1, 3, 2, 4)
+            .reshape(S, B, H)
+            .astype(np.float32)
+        )
 
-        packed_input, valid = self._pad_and_pack_hidden(hidden_batches)
-        self.npu_op.write_buffer("input", packed_input)
-        elapsed = self.npu_op.run_stream()
+    def _head_stacked(self, hidden_SBH_f32):
+        """(S, B, H) float32 hidden → (S, B, C) float32 logits in one matmul."""
+        S, B, H = hidden_SBH_f32.shape
+        flat = hidden_SBH_f32.reshape(S * B, H)
+        logits = flat @ self.cpu_head_weight.T + self.cpu_head_bias
+        return logits.reshape(S, B, self.num_classes)
 
-        outputs = []
-        hidden_flat = self.npu_op.read_buffer(
-            "output",
+    def process_features_stacked(self, features_SBD, valid=None, timings=None):
+        """Run the full chunk path (embed + kernel + head) on stacked features.
+
+        features_SBD: np.ndarray, shape (stream_depth, B, input_dim), float32.
+        valid: number of leading slots that carry real data (others are padding).
+               If None, assumes full depth.
+        Returns (logits_list[valid entries of (B, C) float32], kernel_elapsed_s).
+        """
+        if valid is None:
+            valid = self.stream_depth
+
+        embed_t0 = time.perf_counter()
+        hidden_SBH = self._embed_stacked(features_SBD)
+        embed_s = time.perf_counter() - embed_t0
+
+        pack_t0 = time.perf_counter()
+        packed_input = self._pack_stacked(hidden_SBH)
+        pack_s = time.perf_counter() - pack_t0
+
+        write_t0 = time.perf_counter()
+        self.npu_op.write_input_slot(0, packed_input)
+        write_s = time.perf_counter() - write_t0
+
+        elapsed = self.npu_op.run_stream(timings=timings, slot=0)
+
+        read_t0 = time.perf_counter()
+        hidden_flat = self.npu_op.read_output_slot(
+            0,
             (self.stream_depth * self.B * self.hidden_dim,),
             copy=True,
         )
-        for idx in range(valid):
-            start = idx * self.B * self.hidden_dim
-            stop = (idx + 1) * self.B * self.hidden_dim
-            hidden = from_tiled(hidden_flat[start:stop], self.B, self.hidden_dim).astype(np.float32)
-            outputs.append(hidden @ self.cpu_head_weight.T + self.cpu_head_bias)
+        read_s = time.perf_counter() - read_t0
+
+        detile_t0 = time.perf_counter()
+        hidden_out_SBH = self._detile_stacked(hidden_flat)
+        detile_s = time.perf_counter() - detile_t0
+
+        head_t0 = time.perf_counter()
+        logits_SBC = self._head_stacked(hidden_out_SBH)
+        head_s = time.perf_counter() - head_t0
+
+        outputs = [logits_SBC[i] for i in range(valid)]
+
+        if timings is not None:
+            timings["cpu_embed_s"] = timings.get("cpu_embed_s", 0.0) + embed_s
+            timings["pack_s"] = timings.get("pack_s", 0.0) + pack_s
+            timings["write_buffer_s"] = timings.get("write_buffer_s", 0.0) + write_s
+            timings["read_buffer_s"] = timings.get("read_buffer_s", 0.0) + read_s
+            timings["detile_s"] = timings.get("detile_s", 0.0) + detile_s
+            timings["head_s"] = timings.get("head_s", 0.0) + head_s
         return outputs, elapsed
 
-    def benchmark(self, repeated_features, num_samples, warmup_calls=4):
+    def _prepare_slot_host(self, slot, features_SBD, timings):
+        """Run the pre-dispatch host work for one slot: embed, pack, write_buffer, H2D sync."""
+        embed_t0 = time.perf_counter()
+        hidden_SBH = self._embed_stacked(features_SBD)
+        if timings is not None:
+            timings["cpu_embed_s"] = timings.get("cpu_embed_s", 0.0) + (
+                time.perf_counter() - embed_t0
+            )
+
+        pack_t0 = time.perf_counter()
+        packed = self._pack_stacked(hidden_SBH)
+        if timings is not None:
+            timings["pack_s"] = timings.get("pack_s", 0.0) + (
+                time.perf_counter() - pack_t0
+            )
+
+        write_t0 = time.perf_counter()
+        self.npu_op.write_input_slot(slot, packed)
+        if timings is not None:
+            timings["write_buffer_s"] = timings.get("write_buffer_s", 0.0) + (
+                time.perf_counter() - write_t0
+            )
+
+        h2d_t0 = time.perf_counter()
+        self.npu_op.sync_input_h2d(slot)
+        if timings is not None:
+            timings["h2d_sync_s"] = timings.get("h2d_sync_s", 0.0) + (
+                time.perf_counter() - h2d_t0
+            )
+
+    def _consume_slot_host(self, slot, timings):
+        """Run post-wait host work for one slot: D2H sync, read, detile, head."""
+        d2h_t0 = time.perf_counter()
+        self.npu_op.sync_output_d2h(slot)
+        if timings is not None:
+            timings["d2h_sync_s"] = timings.get("d2h_sync_s", 0.0) + (
+                time.perf_counter() - d2h_t0
+            )
+
+        read_t0 = time.perf_counter()
+        hidden_flat = self.npu_op.read_output_slot(
+            slot,
+            (self.stream_depth * self.B * self.hidden_dim,),
+            copy=True,
+        )
+        if timings is not None:
+            timings["read_buffer_s"] = timings.get("read_buffer_s", 0.0) + (
+                time.perf_counter() - read_t0
+            )
+
+        detile_t0 = time.perf_counter()
+        hidden_SBH = self._detile_stacked(hidden_flat)
+        if timings is not None:
+            timings["detile_s"] = timings.get("detile_s", 0.0) + (
+                time.perf_counter() - detile_t0
+            )
+
+        head_t0 = time.perf_counter()
+        logits_SBC = self._head_stacked(hidden_SBH)
+        if timings is not None:
+            timings["head_s"] = timings.get("head_s", 0.0) + (
+                time.perf_counter() - head_t0
+            )
+        return logits_SBC
+
+    def benchmark(self, repeated_features, num_samples, warmup_calls=4, async_pipe=True):
         if repeated_features.shape[0] != self.B:
             raise ValueError(
                 f"Expected repeated_features batch dimension {self.B}, got {repeated_features.shape[0]}"
@@ -149,32 +268,87 @@ class HiggsStreamingInferenceService:
 
         calls = math.ceil(num_samples / (self.B * self.stream_depth))
         processed_samples = calls * self.B * self.stream_depth
-        repeated_features = repeated_features.contiguous()
+
+        base_BD = repeated_features.contiguous().view(self.B, -1).float().cpu().numpy()
+        stacked_SBD = np.ascontiguousarray(
+            np.broadcast_to(base_BD, (self.stream_depth, self.B, self.input_dim))
+        )
 
         for _ in range(warmup_calls):
-            hidden_batches = [self._embed_batch(repeated_features) for _ in range(self.stream_depth)]
-            self.process_hidden_chunk(hidden_batches)
+            self.process_features_stacked(stacked_SBD)
 
-        cpu_embed_s = 0.0
         kernel_s = 0.0
-        wall_t0 = time.perf_counter()
-        for _ in range(calls):
-            cpu_t0 = time.perf_counter()
-            hidden_batches = [self._embed_batch(repeated_features) for _ in range(self.stream_depth)]
-            cpu_embed_s += time.perf_counter() - cpu_t0
-            _, elapsed = self.process_hidden_chunk(hidden_batches)
-            kernel_s += elapsed
-        wall_s = time.perf_counter() - wall_t0
+        timings = {}
+        if async_pipe and calls >= 2:
+            # Double-buffered pipeline: one slot is dispatched to the NPU while
+            # the host prepares the next slot's inputs and/or consumes the previous
+            # slot's outputs. In steady state: wall = max(host, kernel).
+            wall_t0 = time.perf_counter()
+            # Prime the pipeline with slot 0.
+            self._prepare_slot_host(0, stacked_SBD, timings)
+            k0_start = time.perf_counter()
+            run_prev = self.npu_op.dispatch(0)
+            slot_prev = 0
+            # Prepare slot 1 while slot 0 runs.
+            self._prepare_slot_host(1, stacked_SBD, timings)
+            for i in range(1, calls):
+                slot_next = i % self.NPU_NUM_SLOTS
+                # Wait for the currently-running dispatch, measure kernel_s only by wait time.
+                result = run_prev.wait()
+                kernel_s += time.perf_counter() - k0_start
+                if result != pyxrt.ert_cmd_state.ERT_CMD_STATE_COMPLETED:
+                    raise RuntimeError(
+                        f"Kernel resmlp_streaming did not complete correctly: {result}"
+                    )
+                # Immediately dispatch the next slot (already prepared).
+                k0_start = time.perf_counter()
+                run_prev = self.npu_op.dispatch(slot_next)
+                # Consume the just-finished slot (overlapped with new kernel).
+                self._consume_slot_host(slot_prev, timings)
+                # Prepare the slot after next (overlapped with new kernel too).
+                if i + 1 < calls:
+                    self._prepare_slot_host(slot_prev, stacked_SBD, timings)
+                slot_prev = slot_next
+            # Drain: wait for the final dispatch and consume it.
+            result = run_prev.wait()
+            kernel_s += time.perf_counter() - k0_start
+            if result != pyxrt.ert_cmd_state.ERT_CMD_STATE_COMPLETED:
+                raise RuntimeError(
+                    f"Kernel resmlp_streaming did not complete correctly: {result}"
+                )
+            self._consume_slot_host(slot_prev, timings)
+            wall_s = time.perf_counter() - wall_t0
+        else:
+            wall_t0 = time.perf_counter()
+            for _ in range(calls):
+                _, elapsed = self.process_features_stacked(stacked_SBD, timings=timings)
+                kernel_s += elapsed
+            wall_s = time.perf_counter() - wall_t0
 
-        return {
+        result = {
             "num_samples_requested": num_samples,
             "num_samples_processed": processed_samples,
+            "calls": calls,
             "wall_s": wall_s,
-            "cpu_embed_s": cpu_embed_s,
+            "cpu_embed_s": timings.get("cpu_embed_s", 0.0),
             "kernel_s": kernel_s,
             "wall_sample_s": processed_samples / wall_s,
             "kernel_sample_s": processed_samples / kernel_s,
+            "async_pipe": async_pipe,
         }
+        for key in (
+            "pack_s",
+            "write_buffer_s",
+            "h2d_sync_s",
+            "d2h_sync_s",
+            "read_buffer_s",
+            "detile_s",
+            "head_s",
+        ):
+            result[key] = timings.get(key, 0.0)
+        return result
+
+    NPU_NUM_SLOTS = 2
 
 
 def success_exit_code(observed_acc, expected_acc, *, partial_run=False):
@@ -206,6 +380,11 @@ def main():
     parser.add_argument("--stream-depth", type=int, default=32)
     parser.add_argument("--bench", action="store_true", help="Show timing for evaluation runs")
     parser.add_argument("--bench-samples", type=int, default=None)
+    parser.add_argument(
+        "--no-async-pipe",
+        action="store_true",
+        help="Disable the double-buffered host/kernel overlap (for A/B comparisons)",
+    )
     parser.add_argument("--eval-split", choices=["val", "test"], default=None)
     parser.add_argument("--max-batches", type=int, default=None)
     parser.add_argument("--data-dir", type=str, default="data/higgs_full")
@@ -241,11 +420,16 @@ def main():
 
     if args.bench_samples is not None:
         repeated_features, _, _ = next(dataset_batch_iterator(eval_ds, service.B))
-        stats = service.benchmark(repeated_features, args.bench_samples)
+        stats = service.benchmark(
+            repeated_features,
+            args.bench_samples,
+            async_pipe=not args.no_async_pipe,
+        )
         print("\nRepeated-sample benchmark:")
         for key in (
             "num_samples_requested",
             "num_samples_processed",
+            "calls",
             "wall_s",
             "cpu_embed_s",
             "kernel_s",
@@ -253,6 +437,29 @@ def main():
             "kernel_sample_s",
         ):
             print(f"  {key}: {stats[key]}")
+
+        calls = stats["calls"]
+        print("\nPer-call breakdown (µs):")
+        stage_keys = [
+            ("cpu_embed_s", "cpu_embed"),
+            ("pack_s", "pack(to_tiled)"),
+            ("write_buffer_s", "write_buffer"),
+            ("h2d_sync_s", "h2d_sync(DMA)"),
+            ("kernel_s", "kernel(wait)"),
+            ("d2h_sync_s", "d2h_sync(DMA)"),
+            ("read_buffer_s", "read_buffer"),
+            ("detile_s", "detile(from_tiled)"),
+            ("head_s", "cpu_head"),
+        ]
+        accounted = 0.0
+        for key, label in stage_keys:
+            us_per_call = stats[key] / calls * 1e6
+            print(f"  {label:>20}: {us_per_call:>10.2f} µs/call ({stats[key] * 1000:>9.2f} ms total)")
+            accounted += stats[key]
+        wall_us_per_call = stats["wall_s"] / calls * 1e6
+        unaccounted_us = (stats["wall_s"] - accounted) / calls * 1e6
+        print(f"  {'wall_total':>20}: {wall_us_per_call:>10.2f} µs/call")
+        print(f"  {'unaccounted':>20}: {unaccounted_us:>10.2f} µs/call (loop/Python overhead)")
         return 0
 
     correct = 0
@@ -278,15 +485,18 @@ def main():
         if not batch_group:
             break
 
-        hidden_batches = []
-        batch_meta = []
+        valid = len(batch_group)
         cpu_t0 = time.perf_counter()
-        for features, labels, actual_b in batch_group:
-            hidden_batches.append(service._embed_batch(features))
+        features_SBD = np.zeros(
+            (service.stream_depth, service.B, service.input_dim), dtype=np.float32
+        )
+        batch_meta = []
+        for idx, (features, labels, actual_b) in enumerate(batch_group):
+            features_SBD[idx] = features.contiguous().view(service.B, -1).float().cpu().numpy()
             batch_meta.append((labels, actual_b))
         cpu_time += time.perf_counter() - cpu_t0
 
-        outputs, elapsed = service.process_hidden_chunk(hidden_batches)
+        outputs, elapsed = service.process_features_stacked(features_SBD, valid=valid)
         npu_time += elapsed
         npu_calls += 1
 

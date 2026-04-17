@@ -129,6 +129,8 @@ class StreamingResMLP(AIEOperatorBase):
         self.insts_artifact = insts
         self.add_artifacts([xclbin, insts])
 
+    NUM_SLOTS = 2
+
     def set_up_runtime(self):
         H, B = self.H, self.B
         self.add_kernel(
@@ -137,29 +139,59 @@ class StreamingResMLP(AIEOperatorBase):
             self.xclbin_artifact.kernel_name,
             self.insts_artifact,
         )
-        self.add_buffer("input", self.stream_depth * B * H)
-        self.add_buffer("output", self.stream_depth * B * H)
+        # Two-slot ping-pong BOs for overlapping host work with kernel execution.
+        for slot in range(self.NUM_SLOTS):
+            self.add_buffer(f"input_{slot}", self.stream_depth * B * H)
+            self.add_buffer(f"output_{slot}", self.stream_depth * B * H)
 
-    def _run_args(self):
+    def _run_args(self, slot):
         return (
-            self.buffer_bos["input"],
-            self.buffer_bos["output"],
+            self.buffer_bos[f"input_{slot}"],
+            self.buffer_bos[f"output_{slot}"],
         )
 
     def _sync_buffers(self, names, direction):
         for name in names:
             self.buffer_bos[name].sync(direction)
 
-    def run_stream(self):
-        _, xrt_kernel, insts_bo, insts_len = self.xrt_kernels["resmlp_streaming"]
+    def write_input_slot(self, slot, array):
+        self.write_buffer(f"input_{slot}", array)
+
+    def read_output_slot(self, slot, shape, copy=True):
+        return self.read_buffer(f"output_{slot}", shape, copy=copy)
+
+    def sync_input_h2d(self, slot):
+        self.buffer_bos[f"input_{slot}"].sync(
+            pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE
+        )
+
+    def sync_output_d2h(self, slot):
+        self.buffer_bos[f"output_{slot}"].sync(
+            pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_FROM_DEVICE
+        )
+
+    def _ensure_insts_synced(self):
         if not self._insts_synced:
+            _, _, insts_bo, _ = self.xrt_kernels["resmlp_streaming"]
             insts_bo.sync(pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
             self._insts_synced = True
 
-        self._sync_buffers(["input"], pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
+    def dispatch(self, slot):
+        """Non-blocking kernel dispatch. Returns an XRT Run handle to wait on."""
+        _, xrt_kernel, insts_bo, insts_len = self.xrt_kernels["resmlp_streaming"]
+        self._ensure_insts_synced()
+        return xrt_kernel(3, insts_bo, insts_len, *self._run_args(slot))
+
+    def run_stream(self, timings=None, slot=0):
+        """Legacy synchronous single-slot path (kept for smoke tests and eval fallback)."""
+        self._ensure_insts_synced()
+
+        h2d_t0 = time.perf_counter()
+        self.sync_input_h2d(slot)
+        h2d_s = time.perf_counter() - h2d_t0
 
         start = time.perf_counter()
-        run = xrt_kernel(3, insts_bo, insts_len, *self._run_args())
+        run = self.dispatch(slot)
         result = run.wait()
         elapsed = time.perf_counter() - start
         if result != pyxrt.ert_cmd_state.ERT_CMD_STATE_COMPLETED:
@@ -167,5 +199,11 @@ class StreamingResMLP(AIEOperatorBase):
                 f"Kernel resmlp_streaming did not complete correctly: {result}"
             )
 
-        self._sync_buffers(["output"], pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_FROM_DEVICE)
+        d2h_t0 = time.perf_counter()
+        self.sync_output_d2h(slot)
+        d2h_s = time.perf_counter() - d2h_t0
+
+        if timings is not None:
+            timings["h2d_sync_s"] = timings.get("h2d_sync_s", 0.0) + h2d_s
+            timings["d2h_sync_s"] = timings.get("d2h_sync_s", 0.0) + d2h_s
         return elapsed
