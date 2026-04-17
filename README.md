@@ -21,7 +21,7 @@ The paper itself lives in `docs/whitepaper.tex` and `docs/whitepaper.pdf`.
 
 | Result | Value |
 | --- | --- |
-| Best throughput point | `H=32, L=8`, CPU head, about **4.18M samples/s** wall-clock |
+| Best throughput point | `H=32, L=8`, CPU head, about **2.38M samples/s** wall-clock |
 | Best full-data manual run | `H=32, L=32`, 20-epoch schedule, **76.98%** test acc., **0.8542** ROC AUC |
 | Best validation-selected tuning result | `H=64, L=32`, **77.98%** test acc., **0.8653** ROC AUC, **0.8770** PR AUC |
 | Validated NPU platform | AMD Ryzen AI 9 HX 370 / XDNA 2 |
@@ -167,15 +167,16 @@ MLflow logs go under `mlruns/` and the Optuna study state lives in
 ```bash
 python -m resmlp.streaming_infer build/higgs_h64_l32/resmlp_best.pt \
   --data-dir data/higgs_full \
-  --batch-size 48 \
+  --batch-size 8 \
   --num-cols 8 \
   --stream-depth 32 \
   --bench-samples 50000000
 ```
 
-Use a smaller `--num-cols` value for shallower checkpoints. For the strongest
-throughput point (`H=32, L=8`), the current best wall-clock path keeps the tiny
-classifier head on CPU.
+The paper throughput table uses `B=8` and `stream_depth=32`. Use a smaller
+`--num-cols` value for shallower checkpoints. For the strongest throughput
+point (`H=32, L=8`), the current best wall-clock path keeps the tiny classifier
+head on CPU.
 
 ## Historical material
 

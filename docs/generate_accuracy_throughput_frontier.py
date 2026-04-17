@@ -30,7 +30,7 @@ class ThroughputRow:
     hidden_dim: int
     num_layers: int
     wall_mps: float
-    kernel_mps: float
+    kernel_mps: float | None
 
 
 def parse_args() -> argparse.Namespace:
@@ -99,9 +99,14 @@ def parse_accuracy_rows(tex: str) -> list[AccuracyRow]:
 def parse_throughput_rows(tex: str) -> list[ThroughputRow]:
     """Parse rows from the async/sync throughput table.
 
-    Expected row shape (5 ampersand-separated cells):
+    Expected row shape is either:
       configuration & sync-wall & async-wall & kernel & wall/kernel
-    e.g. `$H=32$, $L=8$, 2 columns  & 1.74M & 2.38M & 2.40M & 99\\%`
+    or:
+      configuration & sync-wall & async-wall
+
+    The frontier figure only uses the async wall-throughput column, but the
+    parser also tolerates the wall-only table shape used during intermediate
+    documentation edits.
     """
     rows: list[ThroughputRow] = []
     num_re = re.compile(r"([\d.]+)M")
@@ -111,23 +116,23 @@ def parse_throughput_rows(tex: str) -> list[ThroughputRow]:
             continue
         clean = strip_table_row(line)
         parts = [part.strip() for part in clean.split("&")]
-        if len(parts) != 5:
+        if len(parts) not in (3, 5):
             continue
         configuration = parts[0]
         match = re.search(r"H=(\d+).+L=(\d+)", configuration)
         if not match:
             continue
         async_wall = num_re.search(parts[2])
-        kernel = num_re.search(parts[3])
-        if async_wall is None or kernel is None:
+        if async_wall is None:
             continue
+        kernel = num_re.search(parts[3]) if len(parts) == 5 else None
         rows.append(
             ThroughputRow(
                 configuration=configuration,
                 hidden_dim=int(match.group(1)),
                 num_layers=int(match.group(2)),
                 wall_mps=float(async_wall.group(1)),
-                kernel_mps=float(kernel.group(1)),
+                kernel_mps=float(kernel.group(1)) if kernel is not None else None,
             )
         )
     return rows

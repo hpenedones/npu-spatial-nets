@@ -143,6 +143,21 @@ class HiggsStreamingInferenceService:
         logits = flat @ self.cpu_head_weight.T + self.cpu_head_bias
         return logits.reshape(S, B, self.num_classes)
 
+    @staticmethod
+    def _add_timing(timings, key, elapsed):
+        if timings is not None:
+            timings[key] = timings.get(key, 0.0) + elapsed
+
+    def _prepare_packed_input(self, features_SBD, timings=None):
+        embed_t0 = time.perf_counter()
+        hidden_SBH = self._embed_stacked(features_SBD)
+        self._add_timing(timings, "cpu_embed_s", time.perf_counter() - embed_t0)
+
+        pack_t0 = time.perf_counter()
+        packed_input = self._pack_stacked(hidden_SBH)
+        self._add_timing(timings, "pack_s", time.perf_counter() - pack_t0)
+        return packed_input
+
     def process_features_stacked(self, features_SBD, valid=None, timings=None):
         """Run the full chunk path (embed + kernel + head) on stacked features.
 
@@ -154,17 +169,11 @@ class HiggsStreamingInferenceService:
         if valid is None:
             valid = self.stream_depth
 
-        embed_t0 = time.perf_counter()
-        hidden_SBH = self._embed_stacked(features_SBD)
-        embed_s = time.perf_counter() - embed_t0
-
-        pack_t0 = time.perf_counter()
-        packed_input = self._pack_stacked(hidden_SBH)
-        pack_s = time.perf_counter() - pack_t0
+        packed_input = self._prepare_packed_input(features_SBD, timings=timings)
 
         write_t0 = time.perf_counter()
         self.npu_op.write_input_slot(0, packed_input)
-        write_s = time.perf_counter() - write_t0
+        self._add_timing(timings, "write_buffer_s", time.perf_counter() - write_t0)
 
         elapsed = self.npu_op.run_stream(timings=timings, slot=0)
 
@@ -174,65 +183,36 @@ class HiggsStreamingInferenceService:
             (self.stream_depth * self.B * self.hidden_dim,),
             copy=True,
         )
-        read_s = time.perf_counter() - read_t0
+        self._add_timing(timings, "read_buffer_s", time.perf_counter() - read_t0)
 
         detile_t0 = time.perf_counter()
         hidden_out_SBH = self._detile_stacked(hidden_flat)
-        detile_s = time.perf_counter() - detile_t0
+        self._add_timing(timings, "detile_s", time.perf_counter() - detile_t0)
 
         head_t0 = time.perf_counter()
         logits_SBC = self._head_stacked(hidden_out_SBH)
-        head_s = time.perf_counter() - head_t0
+        self._add_timing(timings, "head_s", time.perf_counter() - head_t0)
 
         outputs = [logits_SBC[i] for i in range(valid)]
-
-        if timings is not None:
-            timings["cpu_embed_s"] = timings.get("cpu_embed_s", 0.0) + embed_s
-            timings["pack_s"] = timings.get("pack_s", 0.0) + pack_s
-            timings["write_buffer_s"] = timings.get("write_buffer_s", 0.0) + write_s
-            timings["read_buffer_s"] = timings.get("read_buffer_s", 0.0) + read_s
-            timings["detile_s"] = timings.get("detile_s", 0.0) + detile_s
-            timings["head_s"] = timings.get("head_s", 0.0) + head_s
         return outputs, elapsed
 
     def _prepare_slot_host(self, slot, features_SBD, timings):
         """Run the pre-dispatch host work for one slot: embed, pack, write_buffer, H2D sync."""
-        embed_t0 = time.perf_counter()
-        hidden_SBH = self._embed_stacked(features_SBD)
-        if timings is not None:
-            timings["cpu_embed_s"] = timings.get("cpu_embed_s", 0.0) + (
-                time.perf_counter() - embed_t0
-            )
-
-        pack_t0 = time.perf_counter()
-        packed = self._pack_stacked(hidden_SBH)
-        if timings is not None:
-            timings["pack_s"] = timings.get("pack_s", 0.0) + (
-                time.perf_counter() - pack_t0
-            )
+        packed = self._prepare_packed_input(features_SBD, timings=timings)
 
         write_t0 = time.perf_counter()
         self.npu_op.write_input_slot(slot, packed)
-        if timings is not None:
-            timings["write_buffer_s"] = timings.get("write_buffer_s", 0.0) + (
-                time.perf_counter() - write_t0
-            )
+        self._add_timing(timings, "write_buffer_s", time.perf_counter() - write_t0)
 
         h2d_t0 = time.perf_counter()
         self.npu_op.sync_input_h2d(slot)
-        if timings is not None:
-            timings["h2d_sync_s"] = timings.get("h2d_sync_s", 0.0) + (
-                time.perf_counter() - h2d_t0
-            )
+        self._add_timing(timings, "h2d_sync_s", time.perf_counter() - h2d_t0)
 
     def _consume_slot_host(self, slot, timings):
         """Run post-wait host work for one slot: D2H sync, read, detile, head."""
         d2h_t0 = time.perf_counter()
         self.npu_op.sync_output_d2h(slot)
-        if timings is not None:
-            timings["d2h_sync_s"] = timings.get("d2h_sync_s", 0.0) + (
-                time.perf_counter() - d2h_t0
-            )
+        self._add_timing(timings, "d2h_sync_s", time.perf_counter() - d2h_t0)
 
         read_t0 = time.perf_counter()
         hidden_flat = self.npu_op.read_output_slot(
@@ -240,25 +220,34 @@ class HiggsStreamingInferenceService:
             (self.stream_depth * self.B * self.hidden_dim,),
             copy=True,
         )
-        if timings is not None:
-            timings["read_buffer_s"] = timings.get("read_buffer_s", 0.0) + (
-                time.perf_counter() - read_t0
-            )
+        self._add_timing(timings, "read_buffer_s", time.perf_counter() - read_t0)
 
         detile_t0 = time.perf_counter()
         hidden_SBH = self._detile_stacked(hidden_flat)
-        if timings is not None:
-            timings["detile_s"] = timings.get("detile_s", 0.0) + (
-                time.perf_counter() - detile_t0
-            )
+        self._add_timing(timings, "detile_s", time.perf_counter() - detile_t0)
 
         head_t0 = time.perf_counter()
         logits_SBC = self._head_stacked(hidden_SBH)
-        if timings is not None:
-            timings["head_s"] = timings.get("head_s", 0.0) + (
-                time.perf_counter() - head_t0
-            )
+        self._add_timing(timings, "head_s", time.perf_counter() - head_t0)
         return logits_SBC
+
+    def _measure_kernel_wait(self, features_SBD, calls):
+        """Measure pure dispatch+wait time without overlapped host work."""
+        packed_input = self._prepare_packed_input(features_SBD)
+        self.npu_op.write_input_slot(0, packed_input)
+        self.npu_op.sync_input_h2d(0)
+
+        kernel_s = 0.0
+        for _ in range(calls):
+            wait_t0 = time.perf_counter()
+            run = self.npu_op.dispatch(0)
+            result = run.wait()
+            kernel_s += time.perf_counter() - wait_t0
+            if result != pyxrt.ert_cmd_state.ERT_CMD_STATE_COMPLETED:
+                raise RuntimeError(
+                    f"Kernel resmlp_streaming did not complete correctly: {result}"
+                )
+        return kernel_s
 
     def benchmark(self, repeated_features, num_samples, warmup_calls=4, async_pipe=True):
         if repeated_features.shape[0] != self.B:
@@ -277,31 +266,27 @@ class HiggsStreamingInferenceService:
         for _ in range(warmup_calls):
             self.process_features_stacked(stacked_SBD)
 
-        kernel_s = 0.0
         timings = {}
-        if async_pipe and calls >= 2:
+        used_async_pipe = async_pipe and calls >= 2
+        if used_async_pipe:
             # Double-buffered pipeline: one slot is dispatched to the NPU while
             # the host prepares the next slot's inputs and/or consumes the previous
             # slot's outputs. In steady state: wall = max(host, kernel).
             wall_t0 = time.perf_counter()
             # Prime the pipeline with slot 0.
             self._prepare_slot_host(0, stacked_SBD, timings)
-            k0_start = time.perf_counter()
             run_prev = self.npu_op.dispatch(0)
             slot_prev = 0
             # Prepare slot 1 while slot 0 runs.
             self._prepare_slot_host(1, stacked_SBD, timings)
             for i in range(1, calls):
                 slot_next = i % self.NPU_NUM_SLOTS
-                # Wait for the currently-running dispatch, measure kernel_s only by wait time.
                 result = run_prev.wait()
-                kernel_s += time.perf_counter() - k0_start
                 if result != pyxrt.ert_cmd_state.ERT_CMD_STATE_COMPLETED:
                     raise RuntimeError(
                         f"Kernel resmlp_streaming did not complete correctly: {result}"
                     )
                 # Immediately dispatch the next slot (already prepared).
-                k0_start = time.perf_counter()
                 run_prev = self.npu_op.dispatch(slot_next)
                 # Consume the just-finished slot (overlapped with new kernel).
                 self._consume_slot_host(slot_prev, timings)
@@ -311,7 +296,6 @@ class HiggsStreamingInferenceService:
                 slot_prev = slot_next
             # Drain: wait for the final dispatch and consume it.
             result = run_prev.wait()
-            kernel_s += time.perf_counter() - k0_start
             if result != pyxrt.ert_cmd_state.ERT_CMD_STATE_COMPLETED:
                 raise RuntimeError(
                     f"Kernel resmlp_streaming did not complete correctly: {result}"
@@ -319,22 +303,40 @@ class HiggsStreamingInferenceService:
             self._consume_slot_host(slot_prev, timings)
             wall_s = time.perf_counter() - wall_t0
         else:
+            kernel_s = 0.0
             wall_t0 = time.perf_counter()
             for _ in range(calls):
                 _, elapsed = self.process_features_stacked(stacked_SBD, timings=timings)
                 kernel_s += elapsed
             wall_s = time.perf_counter() - wall_t0
 
+        if used_async_pipe:
+            # In the overlapped loop, dispatch→wait spans host work too, so measure
+            # kernel throughput separately with an isolated dispatch+wait calibration.
+            kernel_s = self._measure_kernel_wait(stacked_SBD, calls)
+
+        host_prepare_s = sum(
+            timings.get(key, 0.0)
+            for key in ("cpu_embed_s", "pack_s", "write_buffer_s", "h2d_sync_s")
+        )
+        host_consume_s = sum(
+            timings.get(key, 0.0)
+            for key in ("d2h_sync_s", "read_buffer_s", "detile_s", "head_s")
+        )
+
         result = {
             "num_samples_requested": num_samples,
             "num_samples_processed": processed_samples,
             "calls": calls,
             "wall_s": wall_s,
-            "cpu_embed_s": timings.get("cpu_embed_s", 0.0),
             "kernel_s": kernel_s,
+            "cpu_embed_s": timings.get("cpu_embed_s", 0.0),
+            "host_prepare_s": host_prepare_s,
+            "host_consume_s": host_consume_s,
+            "host_total_s": host_prepare_s + host_consume_s,
             "wall_sample_s": processed_samples / wall_s,
             "kernel_sample_s": processed_samples / kernel_s,
-            "async_pipe": async_pipe,
+            "async_pipe": used_async_pipe,
         }
         for key in (
             "pack_s",
@@ -431,12 +433,14 @@ def main():
             "num_samples_processed",
             "calls",
             "wall_s",
-            "cpu_embed_s",
             "kernel_s",
+            "host_total_s",
             "wall_sample_s",
             "kernel_sample_s",
         ):
             print(f"  {key}: {stats[key]}")
+        if stats["async_pipe"]:
+            print("  kernel_s: isolated dispatch+wait calibration (not the overlapped wall loop)")
 
         calls = stats["calls"]
         print("\nPer-call breakdown (µs):")
@@ -445,21 +449,29 @@ def main():
             ("pack_s", "pack(to_tiled)"),
             ("write_buffer_s", "write_buffer"),
             ("h2d_sync_s", "h2d_sync(DMA)"),
-            ("kernel_s", "kernel(wait)"),
             ("d2h_sync_s", "d2h_sync(DMA)"),
             ("read_buffer_s", "read_buffer"),
             ("detile_s", "detile(from_tiled)"),
             ("head_s", "cpu_head"),
         ]
-        accounted = 0.0
         for key, label in stage_keys:
             us_per_call = stats[key] / calls * 1e6
             print(f"  {label:>20}: {us_per_call:>10.2f} µs/call ({stats[key] * 1000:>9.2f} ms total)")
-            accounted += stats[key]
+        print(
+            f"  {'host_prepare_total':>20}: {stats['host_prepare_s'] / calls * 1e6:>10.2f} µs/call"
+        )
+        print(
+            f"  {'host_consume_total':>20}: {stats['host_consume_s'] / calls * 1e6:>10.2f} µs/call"
+        )
+        print(f"  {'kernel_wait':>20}: {stats['kernel_s'] / calls * 1e6:>10.2f} µs/call")
         wall_us_per_call = stats["wall_s"] / calls * 1e6
-        unaccounted_us = (stats["wall_s"] - accounted) / calls * 1e6
         print(f"  {'wall_total':>20}: {wall_us_per_call:>10.2f} µs/call")
-        print(f"  {'unaccounted':>20}: {unaccounted_us:>10.2f} µs/call (loop/Python overhead)")
+        if stats["async_pipe"]:
+            print("  note: async host stages overlap with the kernel, so their totals do not add up to wall_total")
+        else:
+            accounted = stats["host_total_s"] + stats["kernel_s"]
+            unaccounted_us = (stats["wall_s"] - accounted) / calls * 1e6
+            print(f"  {'unaccounted':>20}: {unaccounted_us:>10.2f} µs/call (loop/Python overhead)")
         return 0
 
     correct = 0

@@ -56,11 +56,12 @@ so that we can address them in the paper.
 
   - The "Mean" Critique: "you have bottlenecked the NPU with a suboptimal software implementation"
 
-  - Status: resolved by the stacked-host + double-buffered pipeline (see
-    `resmlp/streaming_infer.py` and `resmlp/streaming_op.py`). Wall throughput
-    now tracks kernel throughput to within 1\% on all three retained
-    configurations; Table 4 and §5.2 report both sync and async columns for
-    the comparison.
+  - Status: partially resolved by the stacked-host + double-buffered pipeline
+    (see `resmlp/streaming_infer.py` and `resmlp/streaming_op.py`). With the
+    corrected isolated-kernel calibration, the two `H=32` retained
+    configurations land at about 97--99\% of kernel throughput, but the wider
+    `H=64, L=32` accuracy model still sits around 73\%. Table 4 and §5.2 now
+    report sync wall, async wall, isolated kernel, and the async/kernel ratio.
 
 8 - Comparison with the FPGA recent paper
 

@@ -45,17 +45,17 @@ text { font-family: "DejaVu Sans", Arial, sans-serif; fill: #202124; }
 <text class="tick" x="80" y="136.00" text-anchor="end">78.5%</text>
 <line x1="92" y1="132" x2="92" y2="556" stroke="#5f6368" stroke-width="1.5"/>
 <line x1="92" y1="556" x2="802" y2="556" stroke="#5f6368" stroke-width="1.5"/>
-<polyline fill="none" stroke="#5f6368" stroke-width="2.5" points="217.62,205.49 665.46,346.83 681.85,500.88" opacity="0.7"/>
-<circle cx="217.62" cy="205.49" r="7.5" fill="#d95f02" stroke="#ffffff" stroke-width="2"/>
-<rect x="227.62" y="151.49" width="206" height="60" rx="8" fill="#ffffff" fill-opacity="0.9"/>
-<text class="label" x="237.62" y="171.49">H=64, L=32</text>
-<text class="note" x="237.62" y="189.49">1.53M/s, 77.98% acc</text>
-<text class="small" x="237.62" y="205.49">Best accuracy · ROC AUC 0.8653</text>
-<circle cx="665.46" cy="346.83" r="7.5" fill="#2ca02c" stroke="#ffffff" stroke-width="2"/>
-<rect x="675.46" y="292.83" width="206" height="60" rx="8" fill="#ffffff" fill-opacity="0.9"/>
-<text class="label" x="685.46" y="312.83">H=32, L=32</text>
-<text class="note" x="685.46" y="330.83">2.35M/s, 76.98% acc</text>
-<text class="small" x="685.46" y="346.83">Best full-data manual · ROC AUC 0.8542</text>
+<polyline fill="none" stroke="#5f6368" stroke-width="2.5" points="173.92,205.49 610.85,346.83 681.85,500.88" opacity="0.7"/>
+<circle cx="173.92" cy="205.49" r="7.5" fill="#d95f02" stroke="#ffffff" stroke-width="2"/>
+<rect x="183.92" y="151.49" width="206" height="60" rx="8" fill="#ffffff" fill-opacity="0.9"/>
+<text class="label" x="193.92" y="171.49">H=64, L=32</text>
+<text class="note" x="193.92" y="189.49">1.45M/s, 77.98% acc</text>
+<text class="small" x="193.92" y="205.49">Best accuracy · ROC AUC 0.8653</text>
+<circle cx="610.85" cy="346.83" r="7.5" fill="#2ca02c" stroke="#ffffff" stroke-width="2"/>
+<rect x="620.85" y="292.83" width="206" height="60" rx="8" fill="#ffffff" fill-opacity="0.9"/>
+<text class="label" x="630.85" y="312.83">H=32, L=32</text>
+<text class="note" x="630.85" y="330.83">2.25M/s, 76.98% acc</text>
+<text class="small" x="630.85" y="346.83">Best full-data manual · ROC AUC 0.8542</text>
 <circle cx="681.85" cy="500.88" r="7.5" fill="#1f77b4" stroke="#ffffff" stroke-width="2"/>
 <rect x="521.85" y="498.88" width="184" height="60" rx="8" fill="#ffffff" fill-opacity="0.9"/>
 <text class="label" x="531.85" y="518.88">H=32, L=8</text>
@@ -73,10 +73,10 @@ Wall throughput (million samples / s)
 <text class="small" x="876" y="234">ROC AUC 0.8430</text>
 <circle cx="860" cy="259" r="5.5" fill="#2ca02c" stroke="#ffffff" stroke-width="1.5"/>
 <text class="note" x="876" y="264">H=32, L=32 (best full-data manual)</text>
-<text class="small" x="876" y="286">76.98% acc · 2.35M/s wall</text>
+<text class="small" x="876" y="286">76.98% acc · 2.25M/s wall</text>
 <text class="small" x="876" y="302">ROC AUC 0.8542</text>
 <circle cx="860" cy="327" r="5.5" fill="#d95f02" stroke="#ffffff" stroke-width="1.5"/>
 <text class="note" x="876" y="332">H=64, L=32 tuned (best accuracy)</text>
-<text class="small" x="876" y="354">77.98% acc · 1.53M/s wall</text>
+<text class="small" x="876" y="354">77.98% acc · 1.45M/s wall</text>
 <text class="small" x="876" y="370">ROC AUC 0.8653</text>
 </svg>
