@@ -177,45 +177,6 @@ Use a smaller `--num-cols` value for shallower checkpoints. For the strongest
 throughput point (`H=32, L=8`), the current best wall-clock path keeps the tiny
 classifier head on CPU.
 
-## Codebase layout
-
-```text
-resmlp/
-├── model.py                # Residual MLP used for HIGGS training and inference
-├── data_utils.py           # HIGGS-only data loading and split helpers
-├── prepare_higgs_cache.py  # Public-data cache materialization
-├── train.py                # CPU/GPU training entry point
-├── tune_higgs_optuna.py    # MLflow + Optuna HIGGS sweeps
-├── streaming_design.py     # IRON conveyor-belt MLIR generator
-├── streaming_op.py         # XRT operator wrapper for the NPU body
-└── streaming_infer.py      # HIGGS evaluation / throughput benchmark CLI
-
-aie_kernels/
-└── matmul_relu_skip.cc     # Forward residual kernel used by the conveyor belt
-
-tests/
-├── test_higgs_data.py          # Native-width HIGGS data regression tests
-└── test_streaming_inference.py # Streaming residual operator correctness test
-
-docs/
-├── whitepaper.tex          # Paper source
-├── whitepaper.pdf          # Built paper
-├── xdna2_hardware.png      # Hardware figure used in the paper
-├── accuracy_throughput_frontier.svg         # Frontier figure source from paper tables
-├── accuracy_throughput_frontier.pdf         # Paper-ready frontier figure
-├── generate_accuracy_throughput_frontier.py # Regenerates the frontier figure
-├── xdna2_compute_tile_internals.tex         # Standalone compute-tile appendix figure source
-├── xdna2_compute_tile_internals.pdf         # Built compute-tile appendix figure
-├── render_xdna2_compute_tile_internals.sh   # Regenerates the compute-tile appendix figure
-├── higgs_xdna2_model_hardware_mapping.tex   # Standalone mapping figure source
-├── higgs_xdna2_model_hardware_mapping.pdf   # Built mapping figure used in the paper
-├── render_higgs_xdna2_model_hardware_mapping.sh # Regenerates the mapping PDF
-├── generate_higgs_task_diagram.py           # Regenerates the HIGGS task appendix figure
-├── higgs_task_diagram.svg                   # HIGGS task appendix figure source
-├── higgs_task_diagram.png                   # PNG preview of the HIGGS task appendix figure
-└── higgs_task_diagram.pdf                   # Built HIGGS task appendix figure
-```
-
 ## Historical material
 
 Earlier MNIST, CIFAR, convnet, and full backward-pass experiments live on the
