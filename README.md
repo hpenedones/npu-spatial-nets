@@ -55,6 +55,10 @@ A few design rules follow directly from the hardware:
 - widths and batch sizes are chosen in multiples of 8 to match the MMUL path
 - the current best wall-clock path keeps the `28 -> H` embed and `H -> 2` head
   on CPU and pushes the residual body to the NPU
+- a `full_npu` pipeline mode can instead use the first tile for a padded
+  `28 -> H` embed and the last tile for a padded `H -> 8` head, which means the
+  residual body must be retrained at `L = tiles - 2` (for the full 32-tile
+  array, `L=30`)
 - `L=8` uses 2 columns, while `L=32` can occupy the full 8-column array
 
 This is the reason the codebase stays small: the model, runtime contract, and
@@ -162,7 +166,33 @@ python -m resmlp.tune_higgs_optuna \
 MLflow logs go under `mlruns/` and the Optuna study state lives in
 `build/higgs_optuna.db`.
 
-### 4. Benchmark the conveyor-belt NPU path
+### 4. Retrain a full-NPU `L=30` checkpoint
+
+If you want the NPU to own the embed tile, the 30 residual tiles, and the
+final padded head tile in one graph, retrain with `pipeline=full_npu` and
+`L=30`:
+
+```bash
+python -m resmlp.train \
+  --data-dir data/higgs_full \
+  --device cuda \
+  --pipeline full_npu \
+  --hidden-dim 32 \
+  --num-layers 30 \
+  --epochs 20 \
+  --batch-size 8192 \
+  --lr 3e-3 \
+  --min-lr 1e-4 \
+  --weight-decay 1e-4 \
+  --label-smoothing 0 \
+  --save-dir build/higgs_full_h28_l30
+```
+
+This matches the current `H=32` long-schedule recipe, except that two tiles are
+reserved for the on-NPU embed/head stages, so the residual body uses 30 layers
+instead of 32.
+
+### 5. Benchmark the conveyor-belt NPU path
 
 ```bash
 python -m resmlp.streaming_infer build/higgs_h64_l32/resmlp_best.pt \
@@ -176,7 +206,9 @@ python -m resmlp.streaming_infer build/higgs_h64_l32/resmlp_best.pt \
 The paper throughput table uses `B=8` and `stream_depth=32`. Use a smaller
 `--num-cols` value for shallower checkpoints. For the strongest throughput
 point (`H=32, L=8`), the current best wall-clock path keeps the tiny classifier
-head on CPU.
+head on CPU. For a retrained `full_npu` checkpoint, `resmlp.streaming_infer`
+switches automatically to the end-to-end on-array path based on the checkpoint
+metadata.
 
 ## Historical material
 

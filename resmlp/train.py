@@ -127,7 +127,7 @@ def build_checkpoint(args, epoch, model, optimizer, scheduler, eval_name, eval_l
         "optimizer": optimizer.state_dict(),
         "scheduler": scheduler.state_dict() if scheduler is not None else None,
         "dataset": args.dataset,
-        "pipeline": "hybrid",
+        "pipeline": args.pipeline,
         "hidden_dim": args.hidden_dim,
         "num_layers": args.num_layers,
         "input_dim": model.embed.in_features,
@@ -163,6 +163,7 @@ def parse_args(argv=None):
     parser.add_argument("--batch-size", type=int, default=4096)
     parser.add_argument("--hidden-dim", type=int, default=64)
     parser.add_argument("--num-layers", type=int, default=32)
+    parser.add_argument("--pipeline", choices=("hybrid", "full_npu"), default="hybrid")
     parser.add_argument("--residual-bias", action="store_true")
     parser.add_argument("--dataset", choices=SUPPORTED_DATASETS, default="higgs")
     parser.add_argument("--data-dir", type=str, default="data/higgs_full")
@@ -211,6 +212,7 @@ def main(argv=None):
     if resume_ckpt:
         args.hidden_dim = resume_ckpt.get("hidden_dim", args.hidden_dim)
         args.num_layers = resume_ckpt.get("num_layers", args.num_layers)
+        args.pipeline = resume_ckpt.get("pipeline", args.pipeline)
     ckpt_residual_bias = bool(resume_ckpt.get("residual_bias", False)) if resume_ckpt else False
     if resume_ckpt and args.residual_bias and not ckpt_residual_bias:
         raise ValueError(
@@ -235,6 +237,7 @@ def main(argv=None):
     print(f"Model: {sum(p.numel() for p in model.parameters()):,} parameters")
     print(f"  device: {device}")
     print(f"  dataset: {dataset_name}")
+    print(f"  pipeline: {args.pipeline}")
     print(f"  embed: {input_dim} -> {args.hidden_dim}")
     print(f"  hidden: {args.num_layers} x ResidualLinear({args.hidden_dim})")
     print(f"  head: {args.hidden_dim} -> {num_classes}")

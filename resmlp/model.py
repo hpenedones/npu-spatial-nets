@@ -86,11 +86,31 @@ class ResMLP(nn.Module):
         """Backward-compatible alias for residual-layer export."""
         return self.export_residual_weights()
 
-    def export_embed_weight(self):
-        """Export embed weights in NPU layout: `[input_dim, hidden_dim]`."""
+    def export_embed_weight(self, padded_input_dim=None):
+        """Export embed weights in NPU layout: `[input_dim, hidden_dim]`.
+
+        When `padded_input_dim` is provided, zero-pad the input dimension so the
+        matrix can target an 8x8-tiled NPU kernel directly.
+        """
         from ml_dtypes import bfloat16
 
-        return self.embed.weight.detach().cpu().float().numpy().T.astype(bfloat16)
+        weight = self.embed.weight.detach().cpu().float().numpy().T
+        if padded_input_dim is not None:
+            if padded_input_dim < weight.shape[0]:
+                raise ValueError(
+                    f"padded_input_dim={padded_input_dim} is smaller than "
+                    f"input_dim={weight.shape[0]}"
+                )
+            padded = np.zeros((padded_input_dim, weight.shape[1]), dtype=np.float32)
+            padded[: weight.shape[0], :] = weight
+            weight = padded
+        return weight.astype(bfloat16)
+
+    def export_embed_bias(self):
+        """Export embed bias as a bf16 vector of shape `[hidden_dim]`."""
+        from ml_dtypes import bfloat16
+
+        return self.embed.bias.detach().cpu().float().numpy().astype(bfloat16)
 
     def export_head_weight(self, padded_classes=None):
         """Export head weights in NPU layout: `[hidden_dim, num_classes]`.
@@ -112,6 +132,22 @@ class ResMLP(nn.Module):
             weight = padded
         return weight.astype(bfloat16)
 
+    def export_head_bias(self, padded_classes=None):
+        """Export head bias as a bf16 vector, optionally zero-padded."""
+        from ml_dtypes import bfloat16
+
+        bias = self.head.bias.detach().cpu().float().numpy()
+        if padded_classes is not None:
+            if padded_classes < bias.shape[0]:
+                raise ValueError(
+                    f"padded_classes={padded_classes} is smaller than "
+                    f"num_classes={bias.shape[0]}"
+                )
+            padded = np.zeros((padded_classes,), dtype=np.float32)
+            padded[: bias.shape[0]] = bias
+            bias = padded
+        return bias.astype(bfloat16)
+
     def load_residual_weights(self, weights):
         """Load residual-layer weights from numpy arrays in `[H, H]` layout."""
         if len(weights) != len(self.layers):
@@ -130,16 +166,18 @@ class ResMLP(nn.Module):
                 layer.weight.copy_(torch.from_numpy(array))
 
     def load_embed_weight(self, weight):
-        """Load embed weights from NPU layout `[input_dim, hidden_dim]`."""
+        """Load embed weights from NPU layout `[input_dim_or_padded, hidden_dim]`."""
         array = np.asarray(weight, dtype=np.float32)
-        expected = (self.embed.in_features, self.embed.out_features)
-        if array.shape != expected:
+        expected_hidden = self.embed.out_features
+        if array.shape[1] != expected_hidden or array.shape[0] < self.embed.in_features:
             raise ValueError(
-                f"Embed weight has shape {array.shape}, expected {expected}"
+                f"Embed weight has shape {array.shape}, expected (* >= {self.embed.in_features}, "
+                f"{expected_hidden})"
             )
 
+        trimmed = array[: self.embed.in_features, :]
         with torch.no_grad():
-            self.embed.weight.copy_(torch.from_numpy(array.T))
+            self.embed.weight.copy_(torch.from_numpy(trimmed.T))
 
     def load_head_weight(self, weight):
         """Load head weights from NPU layout `[hidden_dim, padded_classes]`."""

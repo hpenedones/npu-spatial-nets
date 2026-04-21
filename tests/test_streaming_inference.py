@@ -30,7 +30,7 @@ from resmlp.design import ROWS_PER_COL
 from resmlp.streaming_op import StreamingResMLP
 
 
-def reference_resmlp(x, weights):
+def reference_residual_body(x, weights):
     x_f32 = x.astype(np.float32)
     for w in weights:
         w_f32 = w.astype(np.float32)
@@ -38,6 +38,16 @@ def reference_resmlp(x, weights):
         relu_out = np.maximum(matmul_out, 0)
         x_f32 = (relu_out + x_f32).astype(bfloat16).astype(np.float32)
     return x_f32.astype(bfloat16)
+
+
+def reference_full_resmlp(x, embed_weight, embed_bias, residual_weights, head_weight, head_bias, num_classes):
+    x_f32 = x.astype(np.float32)
+    hidden = (x_f32 @ embed_weight.astype(np.float32) + embed_bias.astype(np.float32))
+    hidden = hidden.astype(bfloat16).astype(np.float32)
+    hidden = reference_residual_body(hidden.astype(bfloat16), residual_weights).astype(np.float32)
+    logits = hidden @ head_weight.astype(np.float32) + head_bias.astype(np.float32)
+    logits = logits.astype(bfloat16).astype(np.float32)
+    return logits[:, :num_classes]
 
 
 def compare(name, ref, got, rtol, atol):
@@ -71,8 +81,8 @@ def run_test(H=32, B=8, cols=2, stream_depth=1, scale=0.01):
         for _ in range(stream_depth)
     ]
 
-    refs_round1 = [reference_resmlp(x, weights) for x in inputs_round1]
-    refs_round2 = [reference_resmlp(x, weights) for x in inputs_round2]
+    refs_round1 = [reference_residual_body(x, weights) for x in inputs_round1]
+    refs_round2 = [reference_residual_body(x, weights) for x in inputs_round2]
 
     packed_weights = np.stack([np.asarray(to_tiled(w), dtype=bfloat16) for w in weights])
 
@@ -117,8 +127,140 @@ def run_test(H=32, B=8, cols=2, stream_depth=1, scale=0.01):
     return ok
 
 
+def run_full_pipeline_test(H=32, B=8, cols=2, stream_depth=1, input_dim=28, num_classes=2, scale=0.01):
+    rng = np.random.default_rng(123)
+    num_tiles = cols * ROWS_PER_COL
+    num_residual_tiles = num_tiles - 2
+    padded_input_dim = 32
+    padded_output_dim = 8
+
+    embed_weight = np.zeros((padded_input_dim, H), dtype=np.float32)
+    embed_weight[:input_dim, :] = rng.standard_normal((input_dim, H)).astype(np.float32) * scale
+    embed_weight = embed_weight.astype(bfloat16)
+    embed_bias = (rng.standard_normal((H,)).astype(np.float32) * scale).astype(bfloat16)
+
+    residual_weights = [
+        (rng.standard_normal((H, H)).astype(np.float32) * scale).astype(bfloat16)
+        for _ in range(num_residual_tiles)
+    ]
+
+    head_weight = np.zeros((H, padded_output_dim), dtype=np.float32)
+    head_weight[:, :num_classes] = (
+        rng.standard_normal((H, num_classes)).astype(np.float32) * scale
+    )
+    head_weight = head_weight.astype(bfloat16)
+    head_bias = np.zeros((padded_output_dim,), dtype=np.float32)
+    head_bias[:num_classes] = rng.standard_normal((num_classes,)).astype(np.float32) * scale
+    head_bias = head_bias.astype(bfloat16)
+
+    inputs_round1 = [
+        rng.standard_normal((B, input_dim)).astype(np.float32).astype(bfloat16)
+        for _ in range(stream_depth)
+    ]
+    inputs_round2 = [
+        rng.standard_normal((B, input_dim)).astype(np.float32).astype(bfloat16)
+        for _ in range(stream_depth)
+    ]
+
+    refs_round1 = [
+        reference_full_resmlp(
+            x,
+            embed_weight[:input_dim, :],
+            embed_bias,
+            residual_weights,
+            head_weight[:, :num_classes],
+            head_bias[:num_classes],
+            num_classes,
+        )
+        for x in inputs_round1
+    ]
+    refs_round2 = [
+        reference_full_resmlp(
+            x,
+            embed_weight[:input_dim, :],
+            embed_bias,
+            residual_weights,
+            head_weight[:, :num_classes],
+            head_bias[:num_classes],
+            num_classes,
+        )
+        for x in inputs_round2
+    ]
+
+    packed_residual_weights = np.stack(
+        [np.asarray(to_tiled(w), dtype=bfloat16) for w in residual_weights]
+    )
+    packed_embed_weight = np.asarray(to_tiled(embed_weight), dtype=bfloat16)
+    packed_embed_bias = np.asarray(
+        to_tiled(np.broadcast_to(embed_bias, (8, H)).copy()),
+        dtype=bfloat16,
+    )
+    packed_head_weight = np.asarray(to_tiled(head_weight), dtype=bfloat16)
+    packed_head_bias = np.asarray(
+        to_tiled(np.broadcast_to(head_bias, (8, padded_output_dim)).copy()),
+        dtype=bfloat16,
+    )
+
+    ctx = AIEContext(use_runlist=False)
+    op = StreamingResMLP(
+        packed_residual_weights,
+        H=H,
+        B=B,
+        num_cols=cols,
+        stream_depth=stream_depth,
+        context=ctx,
+        pipeline="full_npu",
+        input_dim=input_dim,
+        output_dim=num_classes,
+        packed_embed_weight=packed_embed_weight,
+        packed_embed_bias=packed_embed_bias,
+        packed_head_weight=packed_head_weight,
+        packed_head_bias=packed_head_bias,
+    )
+    print(
+        f"Compiling full-pipeline streaming operator ({num_tiles} tiles, B={B}, H={H}, "
+        f"stream_depth={stream_depth})...",
+        flush=True,
+    )
+    ctx.compile_all()
+    ctx.prepare_runtime()
+
+    ok = True
+    for round_idx, (inputs_group, refs_group) in enumerate(
+        ((inputs_round1, refs_round1), (inputs_round2, refs_round2)),
+        start=1,
+    ):
+        packed_inputs = []
+        for x in inputs_group:
+            padded = np.zeros((B, padded_input_dim), dtype=bfloat16)
+            padded[:, :input_dim] = x
+            packed_inputs.append(np.asarray(to_tiled(padded), dtype=bfloat16))
+
+        op.write_input_slot(0, np.concatenate(packed_inputs))
+        op.run_stream(slot=0)
+        y_flat = op.read_output_slot(0, (stream_depth * B * padded_output_dim,), copy=True)
+
+        for batch_idx, ref in enumerate(refs_group):
+            start = batch_idx * B * padded_output_dim
+            stop = (batch_idx + 1) * B * padded_output_dim
+            got = from_tiled(y_flat[start:stop], B, padded_output_dim)[:, :num_classes]
+            ok &= compare(
+                f"full pipeline round {round_idx} batch {batch_idx}",
+                ref,
+                got,
+                rtol=0.30,
+                atol=0.50,
+            )
+
+    return ok
+
+
 def test_streaming_inference_smoke():
     assert run_test(H=32, B=8, cols=2, stream_depth=1, scale=0.01)
+
+
+def test_full_pipeline_streaming_inference_smoke():
+    assert run_full_pipeline_test(H=32, B=8, cols=2, stream_depth=1, scale=0.01)
 
 
 def main():

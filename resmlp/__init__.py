@@ -32,6 +32,13 @@ import numpy as np
 TILE_BLOCK = 8  # AIE mmul block size (8×8×8 with BFP16 emulation)
 
 
+def round_up_to_tile_multiple(value, block=TILE_BLOCK):
+    """Round ``value`` up to the next ``block`` multiple."""
+    if value <= 0:
+        raise ValueError(f"value must be positive, got {value}")
+    return ((value + block - 1) // block) * block
+
+
 def to_tiled(mat, br=TILE_BLOCK, bc=TILE_BLOCK):
     """Row-major (M, K) matrix → tiled [M/br, K/bc, br, bc] flat layout.
 
