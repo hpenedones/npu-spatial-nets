@@ -293,7 +293,7 @@ def render_svg(
         '<text class="title" x="40" y="42">HIGGS accuracy vs. wall throughput on XDNA2</text>',
         (
             '<text class="subtitle" x="40" y="66">'
-            'Measured points use the CPU-head throughput rows from Table 4 and the retained '
+            'Measured points use the B=8 async wall-throughput rows from Table 4 and the retained '
             'accuracy rows from Table 3.'
             "</text>"
         ),
@@ -349,12 +349,12 @@ def render_svg(
 
     label_positions = {
         "H=64, L=32": (20, -34),
-        "H=32, L=8": (-150, 18),
+        "H=32, L=30": (-188, 18),
         "H=32, L=32": (20, -34),
     }
     label_box_sizes = {
         "H=64, L=32": (206, 60),
-        "H=32, L=8": (184, 60),
+        "H=32, L=30": (220, 60),
         "H=32, L=32": (206, 60),
     }
     for point in measured:
@@ -460,8 +460,8 @@ def main() -> int:
     throughput_rows = parse_throughput_rows(tex)
 
     throughput_point = (
-        find_accuracy(accuracy_rows, 32, 8, "full-data (5 epochs)"),
-        find_throughput(throughput_rows, 32, 8),
+        find_accuracy(accuracy_rows, 32, 30, "full-NPU"),
+        find_throughput(throughput_rows, 32, 30),
     )
     manual_point = (
         find_accuracy(accuracy_rows, 32, 32, "full-data (20 epochs)"),

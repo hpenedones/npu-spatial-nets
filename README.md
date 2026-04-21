@@ -12,7 +12,7 @@ support that story:
 - HIGGS data preparation and normalization
 - CPU/GPU training for the residual MLP
 - MLflow + Optuna tuning for full-data HIGGS runs
-- forward-only streaming NPU inference for the residual body
+- forward-only streaming NPU inference for both the hybrid and full-NPU paths
 - the whitepaper and supporting figures
 
 The paper itself lives in `docs/whitepaper.tex` and `docs/whitepaper.pdf`.
@@ -21,7 +21,7 @@ The paper itself lives in `docs/whitepaper.tex` and `docs/whitepaper.pdf`.
 
 | Result | Value |
 | --- | --- |
-| Best throughput point | `H=32, L=8`, CPU head, about **2.38M samples/s** wall-clock |
+| Best throughput point | `H=32, L=30`, `full_npu`, **14.08M samples/s** wall-clock at `B=64` (**2.44M** at `B=8`) |
 | Best full-data manual run | `H=32, L=32`, 20-epoch schedule, **76.98%** test acc., **0.8542** ROC AUC |
 | Best validation-selected tuning result | `H=64, L=32`, **77.98%** test acc., **0.8653** ROC AUC, **0.8770** PR AUC |
 | Validated NPU platform | AMD Ryzen AI 9 HX 370 / XDNA 2 |
@@ -53,12 +53,14 @@ A few design rules follow directly from the hardware:
 
 - one residual matrix lives on one compute tile
 - widths and batch sizes are chosen in multiples of 8 to match the MMUL path
-- the current best wall-clock path keeps the `28 -> H` embed and `H -> 2` head
-  on CPU and pushes the residual body to the NPU
+- the original `hybrid` path keeps the `28 -> H` embed and `H -> 2` head on CPU
+  and pushes the residual body to the NPU
 - a `full_npu` pipeline mode can instead use the first tile for a padded
   `28 -> H` embed and the last tile for a padded `H -> 8` head, which means the
   residual body must be retrained at `L = tiles - 2` (for the full 32-tile
   array, `L=30`)
+- the current wall-clock leader is that retrained `full_npu` `H=32, L=30`
+  checkpoint, which reaches about `14.08M` samples/s at `B=64`
 - `L=8` uses 2 columns, while `L=32` can occupy the full 8-column array
 
 This is the reason the codebase stays small: the model, runtime contract, and
@@ -204,11 +206,11 @@ python -m resmlp.streaming_infer build/higgs_h64_l32/resmlp_best.pt \
 ```
 
 The paper throughput table uses `B=8` and `stream_depth=32`. Use a smaller
-`--num-cols` value for shallower checkpoints. For the strongest throughput
-point (`H=32, L=8`), the current best wall-clock path keeps the tiny classifier
-head on CPU. For a retrained `full_npu` checkpoint, `resmlp.streaming_infer`
-switches automatically to the end-to-end on-array path based on the checkpoint
-metadata.
+`--num-cols` value for shallower checkpoints. The legacy `H=32, L=8` throughput
+point still uses the `hybrid` CPU-head path, while a retrained `full_npu`
+checkpoint switches automatically to the end-to-end on-array path based on the
+checkpoint metadata. The repaired `H=32, L=30` full-NPU checkpoint reaches
+about **2.44M samples/s** at `B=8` and **14.08M samples/s** at `B=64`.
 
 ## Historical material
 

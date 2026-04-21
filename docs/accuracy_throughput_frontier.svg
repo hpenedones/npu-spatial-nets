@@ -13,54 +13,50 @@ text { font-family: "DejaVu Sans", Arial, sans-serif; fill: #202124; }
 .label { font-size: 13px; font-weight: 600; }
 </style>
 <text class="title" x="40" y="42">HIGGS accuracy vs. wall throughput on XDNA2</text>
-<text class="subtitle" x="40" y="66">Measured points use the CPU-head throughput rows from Table 4 and the retained accuracy rows from Table 3.</text>
+<text class="subtitle" x="40" y="66">Measured points use the B=8 async wall-throughput rows from Table 4 and the retained accuracy rows from Table 3.</text>
 <text class="subtitle" x="40" y="86">All three retained operating points now have measured hardware throughput.</text>
 <line x1="92.00" y1="132" x2="92.00" y2="556" stroke="#eceff1" stroke-width="1"/>
 <text class="tick" x="92.00" y="580" text-anchor="middle">1.3</text>
-<line x1="201.23" y1="132" x2="201.23" y2="556" stroke="#eceff1" stroke-width="1"/>
-<text class="tick" x="201.23" y="580" text-anchor="middle">1.5</text>
-<line x1="310.46" y1="132" x2="310.46" y2="556" stroke="#eceff1" stroke-width="1"/>
-<text class="tick" x="310.46" y="580" text-anchor="middle">1.7</text>
-<line x1="419.69" y1="132" x2="419.69" y2="556" stroke="#eceff1" stroke-width="1"/>
-<text class="tick" x="419.69" y="580" text-anchor="middle">1.9</text>
-<line x1="528.92" y1="132" x2="528.92" y2="556" stroke="#eceff1" stroke-width="1"/>
-<text class="tick" x="528.92" y="580" text-anchor="middle">2.1</text>
-<line x1="638.15" y1="132" x2="638.15" y2="556" stroke="#eceff1" stroke-width="1"/>
-<text class="tick" x="638.15" y="580" text-anchor="middle">2.3</text>
-<line x1="747.38" y1="132" x2="747.38" y2="556" stroke="#eceff1" stroke-width="1"/>
-<text class="tick" x="747.38" y="580" text-anchor="middle">2.5</text>
+<line x1="221.09" y1="132" x2="221.09" y2="556" stroke="#eceff1" stroke-width="1"/>
+<text class="tick" x="221.09" y="580" text-anchor="middle">1.5</text>
+<line x1="350.18" y1="132" x2="350.18" y2="556" stroke="#eceff1" stroke-width="1"/>
+<text class="tick" x="350.18" y="580" text-anchor="middle">1.7</text>
+<line x1="479.27" y1="132" x2="479.27" y2="556" stroke="#eceff1" stroke-width="1"/>
+<text class="tick" x="479.27" y="580" text-anchor="middle">1.9</text>
+<line x1="608.36" y1="132" x2="608.36" y2="556" stroke="#eceff1" stroke-width="1"/>
+<text class="tick" x="608.36" y="580" text-anchor="middle">2.1</text>
+<line x1="737.45" y1="132" x2="737.45" y2="556" stroke="#eceff1" stroke-width="1"/>
+<text class="tick" x="737.45" y="580" text-anchor="middle">2.3</text>
 <line x1="92" y1="556.00" x2="802" y2="556.00" stroke="#eceff1" stroke-width="1"/>
-<text class="tick" x="80" y="560.00" text-anchor="end">75.5%</text>
-<line x1="92" y1="485.33" x2="802" y2="485.33" stroke="#eceff1" stroke-width="1"/>
-<text class="tick" x="80" y="489.33" text-anchor="end">76.0%</text>
-<line x1="92" y1="414.67" x2="802" y2="414.67" stroke="#eceff1" stroke-width="1"/>
-<text class="tick" x="80" y="418.67" text-anchor="end">76.5%</text>
-<line x1="92" y1="344.00" x2="802" y2="344.00" stroke="#eceff1" stroke-width="1"/>
-<text class="tick" x="80" y="348.00" text-anchor="end">77.0%</text>
-<line x1="92" y1="273.33" x2="802" y2="273.33" stroke="#eceff1" stroke-width="1"/>
-<text class="tick" x="80" y="277.33" text-anchor="end">77.5%</text>
-<line x1="92" y1="202.67" x2="802" y2="202.67" stroke="#eceff1" stroke-width="1"/>
-<text class="tick" x="80" y="206.67" text-anchor="end">78.0%</text>
+<text class="tick" x="80" y="560.00" text-anchor="end">76.0%</text>
+<line x1="92" y1="471.20" x2="802" y2="471.20" stroke="#eceff1" stroke-width="1"/>
+<text class="tick" x="80" y="475.20" text-anchor="end">76.5%</text>
+<line x1="92" y1="386.40" x2="802" y2="386.40" stroke="#eceff1" stroke-width="1"/>
+<text class="tick" x="80" y="390.40" text-anchor="end">77.0%</text>
+<line x1="92" y1="301.60" x2="802" y2="301.60" stroke="#eceff1" stroke-width="1"/>
+<text class="tick" x="80" y="305.60" text-anchor="end">77.5%</text>
+<line x1="92" y1="216.80" x2="802" y2="216.80" stroke="#eceff1" stroke-width="1"/>
+<text class="tick" x="80" y="220.80" text-anchor="end">78.0%</text>
 <line x1="92" y1="132.00" x2="802" y2="132.00" stroke="#eceff1" stroke-width="1"/>
 <text class="tick" x="80" y="136.00" text-anchor="end">78.5%</text>
 <line x1="92" y1="132" x2="92" y2="556" stroke="#5f6368" stroke-width="1.5"/>
 <line x1="92" y1="556" x2="802" y2="556" stroke="#5f6368" stroke-width="1.5"/>
-<polyline fill="none" stroke="#5f6368" stroke-width="2.5" points="173.92,205.49 610.85,346.83 681.85,500.88" opacity="0.7"/>
-<circle cx="173.92" cy="205.49" r="7.5" fill="#d95f02" stroke="#ffffff" stroke-width="2"/>
-<rect x="183.92" y="151.49" width="206" height="60" rx="8" fill="#ffffff" fill-opacity="0.9"/>
-<text class="label" x="193.92" y="171.49">H=64, L=32</text>
-<text class="note" x="193.92" y="189.49">1.45M/s, 77.98% acc</text>
-<text class="small" x="193.92" y="205.49">Best accuracy · ROC AUC 0.8653</text>
-<circle cx="610.85" cy="346.83" r="7.5" fill="#2ca02c" stroke="#ffffff" stroke-width="2"/>
-<rect x="620.85" y="292.83" width="206" height="60" rx="8" fill="#ffffff" fill-opacity="0.9"/>
-<text class="label" x="630.85" y="312.83">H=32, L=32</text>
-<text class="note" x="630.85" y="330.83">2.25M/s, 76.98% acc</text>
-<text class="small" x="630.85" y="346.83">Best full-data manual · ROC AUC 0.8542</text>
-<circle cx="681.85" cy="500.88" r="7.5" fill="#1f77b4" stroke="#ffffff" stroke-width="2"/>
-<rect x="521.85" y="498.88" width="184" height="60" rx="8" fill="#ffffff" fill-opacity="0.9"/>
-<text class="label" x="531.85" y="518.88">H=32, L=8</text>
-<text class="note" x="531.85" y="536.88">2.38M/s, 75.89% acc</text>
-<text class="small" x="531.85" y="552.88">Best throughput · ROC AUC 0.8430</text>
+<polyline fill="none" stroke="#5f6368" stroke-width="2.5" points="188.82,220.19 498.64,452.54 705.18,389.79" opacity="0.7"/>
+<circle cx="188.82" cy="220.19" r="7.5" fill="#d95f02" stroke="#ffffff" stroke-width="2"/>
+<rect x="198.82" y="166.19" width="206" height="60" rx="8" fill="#ffffff" fill-opacity="0.9"/>
+<text class="label" x="208.82" y="186.19">H=64, L=32</text>
+<text class="note" x="208.82" y="204.19">1.45M/s, 77.98% acc</text>
+<text class="small" x="208.82" y="220.19">Best accuracy · ROC AUC 0.8653</text>
+<circle cx="498.64" cy="452.54" r="7.5" fill="#1f77b4" stroke="#ffffff" stroke-width="2"/>
+<rect x="300.64" y="450.54" width="220" height="60" rx="8" fill="#ffffff" fill-opacity="0.9"/>
+<text class="label" x="310.64" y="470.54">H=32, L=30</text>
+<text class="note" x="310.64" y="488.54">1.93M/s, 76.61% acc</text>
+<text class="small" x="310.64" y="504.54">Best throughput · ROC AUC 0.8507</text>
+<circle cx="705.18" cy="389.79" r="7.5" fill="#2ca02c" stroke="#ffffff" stroke-width="2"/>
+<rect x="715.18" y="335.79" width="206" height="60" rx="8" fill="#ffffff" fill-opacity="0.9"/>
+<text class="label" x="725.18" y="355.79">H=32, L=32</text>
+<text class="note" x="725.18" y="373.79">2.25M/s, 76.98% acc</text>
+<text class="small" x="725.18" y="389.79">Best full-data manual · ROC AUC 0.8542</text>
 <text class="axis-label" x="447.00" y="644" text-anchor="middle">
 Wall throughput (million samples / s)
 </text>
@@ -68,9 +64,9 @@ Wall throughput (million samples / s)
 <rect x="842" y="132" width="324" height="286" rx="14" fill="#f8f9fa" stroke="#dadce0"/>
 <text class="panel-title" x="860" y="162">Retained operating points</text>
 <circle cx="860" cy="191" r="5.5" fill="#1f77b4" stroke="#ffffff" stroke-width="1.5"/>
-<text class="note" x="876" y="196">H=32, L=8 (throughput point)</text>
-<text class="small" x="876" y="218">75.89% acc · 2.38M/s wall</text>
-<text class="small" x="876" y="234">ROC AUC 0.8430</text>
+<text class="note" x="876" y="196">H=32, L=30 (throughput point)</text>
+<text class="small" x="876" y="218">76.61% acc · 1.93M/s wall</text>
+<text class="small" x="876" y="234">ROC AUC 0.8507</text>
 <circle cx="860" cy="259" r="5.5" fill="#2ca02c" stroke="#ffffff" stroke-width="1.5"/>
 <text class="note" x="876" y="264">H=32, L=32 (best full-data manual)</text>
 <text class="small" x="876" y="286">76.98% acc · 2.25M/s wall</text>
