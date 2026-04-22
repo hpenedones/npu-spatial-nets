@@ -1,8 +1,7 @@
 """
-Compile and validate the resident streaming residual inference operator.
+Compile and validate the resident full-NPU streaming residual inference operator.
 
-The key property under test is not "one giant window", but a host-facing
-continuous service shape:
+The key property under test is a host-facing continuous service shape:
 
   - compile once
   - embed weights once in the xclbin
@@ -62,69 +61,6 @@ def compare(name, ref, got, rtol, atol):
         print(f"    ref [0,:5]: {ref_f32.reshape(ref.shape)[0, :5]}")
         print(f"    npu [0,:5]: {got_f32.reshape(got.shape)[0, :5]}")
     return pct > 95
-
-
-def run_test(H=32, B=8, cols=2, stream_depth=1, scale=0.01):
-    rng = np.random.default_rng(123)
-    num_tiles = cols * ROWS_PER_COL
-
-    weights = [
-        (rng.standard_normal((H, H)).astype(np.float32) * scale).astype(bfloat16)
-        for _ in range(num_tiles)
-    ]
-    inputs_round1 = [
-        rng.standard_normal((B, H)).astype(np.float32).astype(bfloat16)
-        for _ in range(stream_depth)
-    ]
-    inputs_round2 = [
-        rng.standard_normal((B, H)).astype(np.float32).astype(bfloat16)
-        for _ in range(stream_depth)
-    ]
-
-    refs_round1 = [reference_residual_body(x, weights) for x in inputs_round1]
-    refs_round2 = [reference_residual_body(x, weights) for x in inputs_round2]
-
-    packed_weights = np.stack([np.asarray(to_tiled(w), dtype=bfloat16) for w in weights])
-
-    ctx = AIEContext(use_runlist=False)
-    op = StreamingResMLP(
-        packed_weights,
-        H=H,
-        B=B,
-        num_cols=cols,
-        stream_depth=stream_depth,
-        context=ctx,
-    )
-    print(
-        f"Compiling streaming inference operator ({num_tiles} tiles, B={B}, H={H}, "
-        f"stream_depth={stream_depth})...",
-        flush=True,
-    )
-    ctx.compile_all()
-    ctx.prepare_runtime()
-
-    ok = True
-    for round_idx, (inputs_group, refs_group) in enumerate(
-        ((inputs_round1, refs_round1), (inputs_round2, refs_round2)),
-        start=1,
-    ):
-        op.write_input_slot(0, np.concatenate([to_tiled(x) for x in inputs_group]))
-        op.run_stream(slot=0)
-        y_flat = op.read_output_slot(0, (stream_depth * B * H,), copy=True)
-
-        for batch_idx, ref in enumerate(refs_group):
-            start = batch_idx * B * H
-            stop = (batch_idx + 1) * B * H
-            got = from_tiled(y_flat[start:stop], B, H)
-            ok &= compare(
-                f"round {round_idx} batch {batch_idx}",
-                ref,
-                got,
-                rtol=0.30,
-                atol=0.50,
-            )
-
-    return ok
 
 
 def run_full_pipeline_test(H=32, B=8, cols=2, stream_depth=1, input_dim=28, num_classes=2, scale=0.01):
@@ -209,7 +145,6 @@ def run_full_pipeline_test(H=32, B=8, cols=2, stream_depth=1, input_dim=28, num_
         num_cols=cols,
         stream_depth=stream_depth,
         context=ctx,
-        pipeline="full_npu",
         input_dim=input_dim,
         output_dim=num_classes,
         packed_embed_weight=packed_embed_weight,
@@ -255,16 +190,12 @@ def run_full_pipeline_test(H=32, B=8, cols=2, stream_depth=1, input_dim=28, num_
     return ok
 
 
-def test_streaming_inference_smoke():
-    assert run_test(H=32, B=8, cols=2, stream_depth=1, scale=0.01)
-
-
 def test_full_pipeline_streaming_inference_smoke():
     assert run_full_pipeline_test(H=32, B=8, cols=2, stream_depth=1, scale=0.01)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Test resident streaming inference")
+    parser = argparse.ArgumentParser(description="Test resident full-NPU streaming inference")
     parser.add_argument("--H", type=int, default=32)
     parser.add_argument("--B", type=int, default=8)
     parser.add_argument("--cols", type=int, default=2)
@@ -273,10 +204,10 @@ def main():
     args = parser.parse_args()
 
     print(
-        f"═══ Streaming inference test (cols={args.cols}, B={args.B}, "
+        f"═══ Full-NPU streaming inference test (cols={args.cols}, B={args.B}, "
         f"H={args.H}, stream_depth={args.stream_depth}) ═══\n"
     )
-    ok = run_test(
+    ok = run_full_pipeline_test(
         H=args.H,
         B=args.B,
         cols=args.cols,

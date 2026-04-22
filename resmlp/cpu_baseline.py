@@ -1,13 +1,12 @@
 """CPU throughput baseline for the residual MLP.
 
-Measures pure-CPU forward-pass throughput for the same model configurations
-reported in the paper (H=32/L=8 speed variant, H=64/L=32 accuracy variant).
-This provides the missing baseline identified in the peer review (Issue #1):
-the NPU throughput claim needs a CPU comparison point.
+Measures pure-CPU forward-pass throughput for the same model configuration
+reported in the paper (H=32, L=30 full-NPU), so the NPU and CPU numbers compare
+the identical architecture on the same host.
 
 Usage:
     python -m resmlp.cpu_baseline
-    python -m resmlp.cpu_baseline --hidden-dim 64 --num-layers 32 --batch-size 256
+    python -m resmlp.cpu_baseline --hidden-dim 32 --num-layers 30 --batch-sizes 8 64 256 1024
 """
 
 import argparse
@@ -19,10 +18,9 @@ import torch
 
 from resmlp.model import ResMLP
 
-# Paper configurations
+# Paper configuration
 CONFIGS = {
-    "speed": {"hidden_dim": 32, "num_layers": 8},
-    "accuracy": {"hidden_dim": 64, "num_layers": 32},
+    "retained": {"hidden_dim": 32, "num_layers": 30},
 }
 
 INPUT_DIM = 28
@@ -126,9 +124,9 @@ def main(argv=None):
         description="CPU throughput baseline for the residual MLP"
     )
     parser.add_argument(
-        "--configs", nargs="*", default=["speed", "accuracy"],
+        "--configs", nargs="*", default=["retained"],
         choices=list(CONFIGS.keys()),
-        help="Which paper configurations to benchmark (default: both)",
+        help="Which paper configurations to benchmark (default: retained)",
     )
     parser.add_argument("--hidden-dim", type=int, default=None,
                         help="Override hidden dim (runs a single custom config)")
@@ -150,8 +148,8 @@ def main(argv=None):
     print(f"  NumPy {np.__version__}")
 
     if args.hidden_dim is not None or args.num_layers is not None:
-        h = args.hidden_dim or 64
-        l = args.num_layers or 32
+        h = args.hidden_dim or 32
+        l = args.num_layers or 30
         run_config("custom", h, l, args.batch_sizes, args.num_samples)
     else:
         for name in args.configs:

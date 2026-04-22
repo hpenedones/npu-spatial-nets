@@ -12,7 +12,7 @@ support that story:
 - HIGGS data preparation and normalization
 - CPU/GPU training for the residual MLP
 - MLflow + Optuna tuning for full-data HIGGS runs
-- forward-only streaming NPU inference for both the hybrid and full-NPU paths
+- forward-only streaming full-NPU inference: embed tile + 30 residual tiles + head tile
 - the whitepaper and supporting figures
 
 The paper itself lives in `docs/whitepaper.tex` and `docs/whitepaper.pdf`.
@@ -21,9 +21,9 @@ The paper itself lives in `docs/whitepaper.tex` and `docs/whitepaper.pdf`.
 
 | Result | Value |
 | --- | --- |
-| Best throughput point | `H=32, L=30`, `full_npu`, **14.08M samples/s** wall-clock at `B=64` (**2.44M** at `B=8`) |
-| Best full-data manual run | `H=32, L=32`, 20-epoch schedule, **76.98%** test acc., **0.8542** ROC AUC |
-| Best validation-selected tuning result | `H=64, L=32`, **77.98%** test acc., **0.8653** ROC AUC, **0.8770** PR AUC |
+| Throughput | `H=32, L=30`, full-NPU, **14.08M samples/s** wall-clock at `B=64` (**2.44M** at `B=8`) |
+| Accuracy | `H=32, L=30`, **76.61%** test acc., **0.8507** ROC AUC |
+| CPU baseline (same host) | **0.98M** samples/s peak (12-core Ryzen AI, NumPy) — NPU is ~14× faster at best operating points |
 | Validated NPU platform | AMD Ryzen AI 9 HX 370 / XDNA 2 |
 
 ## Direct mapping from network to hardware
@@ -32,36 +32,33 @@ The logical deployment path is:
 
 ```mermaid
 flowchart LR
-    X[HIGGS features<br/>28 floats] --> E[CPU embed<br/>28 -> H]
+    X[HIGGS features<br/>28 floats] --> PAD[Pad 28 -> 32]
 
     subgraph NPU[AMD XDNA 2 NPU conveyor belt]
         direction LR
-        T1[Tile 1<br/>Residual block 1]
-        T2[Tile 2<br/>Residual block 2]
-        T3[Tile 3<br/>Residual block 3]
+        TE[Embed tile<br/>32 -> H]
+        T1[Residual tile 1]
+        T2[Residual tile 2]
         TD[...]
-        TL[Tile L<br/>Residual block L]
-        T1 --> T2 --> T3 --> TD --> TL
+        TL[Residual tile 30]
+        TH[Head tile<br/>H -> 8 padded]
+        TE --> T1 --> T2 --> TD --> TL --> TH
     end
 
-    E --> T1
-    TL --> H[CPU head<br/>H -> 2]
-    H --> Y[Signal / background]
+    PAD --> TE
+    TH --> Y[Signal / background]
 ```
 
 A few design rules follow directly from the hardware:
 
 - one residual matrix lives on one compute tile
 - widths and batch sizes are chosen in multiples of 8 to match the MMUL path
-- the original `hybrid` path keeps the `28 -> H` embed and `H -> 2` head on CPU
-  and pushes the residual body to the NPU
-- a `full_npu` pipeline mode can instead use the first tile for a padded
-  `28 -> H` embed and the last tile for a padded `H -> 8` head, which means the
-  residual body must be retrained at `L = tiles - 2` (for the full 32-tile
-  array, `L=30`)
-- the current wall-clock leader is that retrained `full_npu` `H=32, L=30`
-  checkpoint, which reaches about `14.08M` samples/s at `B=64`
-- `L=8` uses 2 columns, while `L=32` can occupy the full 8-column array
+- the first tile runs the padded `32 -> H` embed; the last tile runs the
+  padded `H -> 8` head; the remaining 30 tiles run the residual body
+- the full 32-tile array is used end-to-end; there is no CPU embed or CPU head
+  on the inference hot path
+- the current leader is `H=32, L=30`, which reaches about `14.08M` samples/s at
+  `B=64`
 
 This is the reason the codebase stays small: the model, runtime contract, and
 hardware mapping line up closely enough that the paper can be validated without
@@ -141,44 +138,12 @@ python -m resmlp.prepare_higgs_cache \
 This materializes a split-aware `data/higgs_full/HIGGS.pt` cache from the
 public `jxie/higgs` mirror.
 
-### 2. Train a strong HIGGS model on GPU
+### 2. Train the full-NPU `H=32, L=30` checkpoint
 
 ```bash
 python -m resmlp.train \
   --data-dir data/higgs_full \
   --device cuda \
-  --epochs 50 \
-  --save-dir build/higgs_h64_l32
-```
-
-The current defaults target the strongest region found so far:
-`H=64`, `L=32`, AdamW, cosine decay, moderate label smoothing, and full-data
-validation.
-
-### 3. Launch an MLflow + Optuna sweep
-
-```bash
-python -m resmlp.tune_higgs_optuna \
-  --data-dir data/higgs_full \
-  --device cuda \
-  --study-name higgs-full-exploit \
-  --experiment-name higgs-full-optuna
-```
-
-MLflow logs go under `mlruns/` and the Optuna study state lives in
-`build/higgs_optuna.db`.
-
-### 4. Retrain a full-NPU `L=30` checkpoint
-
-If you want the NPU to own the embed tile, the 30 residual tiles, and the
-final padded head tile in one graph, retrain with `pipeline=full_npu` and
-`L=30`:
-
-```bash
-python -m resmlp.train \
-  --data-dir data/higgs_full \
-  --device cuda \
-  --pipeline full_npu \
   --hidden-dim 32 \
   --num-layers 30 \
   --epochs 20 \
@@ -187,30 +152,39 @@ python -m resmlp.train \
   --min-lr 1e-4 \
   --weight-decay 1e-4 \
   --label-smoothing 0 \
-  --save-dir build/higgs_full_h28_l30
+  --save-dir build/higgs_full_h32_l30
 ```
 
-This matches the current `H=32` long-schedule recipe, except that two tiles are
-reserved for the on-NPU embed/head stages, so the residual body uses 30 layers
-instead of 32.
+The residual body uses 30 layers so that embed and head each get one of the 32
+NPU tiles.
 
-### 5. Benchmark the conveyor-belt NPU path
+### 3. Benchmark the conveyor-belt NPU path
 
 ```bash
-python -m resmlp.streaming_infer build/higgs_h64_l32/resmlp_best.pt \
+python -m resmlp.streaming_infer build/higgs_full_h32_l30/resmlp_best.pt \
   --data-dir data/higgs_full \
-  --batch-size 8 \
+  --batch-size 64 \
   --num-cols 8 \
   --stream-depth 32 \
   --bench-samples 50000000
 ```
 
-The paper throughput table uses `B=8` and `stream_depth=32`. Use a smaller
-`--num-cols` value for shallower checkpoints. The legacy `H=32, L=8` throughput
-point still uses the `hybrid` CPU-head path, while a retrained `full_npu`
-checkpoint switches automatically to the end-to-end on-array path based on the
-checkpoint metadata. The repaired `H=32, L=30` full-NPU checkpoint reaches
-about **2.44M samples/s** at `B=8` and **14.08M samples/s** at `B=64`.
+The paper throughput table uses `stream_depth=32` and reports `B=8` and `B=64`.
+The full-NPU checkpoint reaches about **2.44M samples/s** at `B=8` and
+**14.08M samples/s** at `B=64`.
+
+### 4. Compare to the same-host CPU baseline
+
+```bash
+python -m resmlp.cpu_baseline \
+  --hidden-dim 32 --num-layers 30 \
+  --batch-sizes 8 64 256 1024 \
+  --num-samples 5000000
+```
+
+On the same 12-core Ryzen AI host the peak CPU throughput is about
+`0.98M samples/s` (NumPy, `B=256`), so the NPU path is roughly `14×` faster at
+its best operating point and `17×` faster at `B=8`.
 
 ## Historical material
 

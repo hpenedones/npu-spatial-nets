@@ -1,14 +1,9 @@
-"""
-IRON design for forward-only residual MLP streaming inference with embedded weights.
+"""IRON design for the full-NPU residual MLP streaming inference pipeline.
 
 Each tile gets a compile-time initialized local weight buffer, so repeated host
-calls only stream activations in and activations out.
-
-Two deployment shapes are supported:
-
-  - ``hybrid``: host CPU performs embed/head, NPU runs only the residual body
-  - ``full_npu``: one tile runs embed, the middle tiles run residual blocks,
-    and the final tile runs the padded head stage
+calls only stream activations in and activations out. The array runs the embed
+stage on the first tile, the residual body on the middle tiles, and the padded
+head stage on the final tile.
 """
 
 from pathlib import Path
@@ -69,7 +64,6 @@ def snake_streaming_pipeline(
     B=8,
     num_cols=8,
     stream_depth=32,
-    pipeline="hybrid",
     residual_archive_name="resmlp_streaming_kernel.a",
     residual_weights_path=None,
     embed_archive_name=None,
@@ -81,14 +75,26 @@ def snake_streaming_pipeline(
     input_dim_device=None,
     output_dim_device=None,
 ):
-    """Generate a forward-only residual snake with compile-time embedded weights."""
+    """Generate the forward-only full-NPU residual snake with compile-time embedded weights."""
     assert 1 <= num_cols <= 8
     assert B % TILE_BLOCK == 0 and H % TILE_BLOCK == 0
     assert stream_depth >= 1
     if residual_weights_path is None:
         raise ValueError("residual_weights_path is required for streaming inference")
+    if embed_archive_name is None or head_archive_name is None:
+        raise ValueError("embed and head archive names are required")
+    if embed_weights_path is None or embed_bias_path is None:
+        raise ValueError("embed weights and bias are required")
+    if head_weights_path is None or head_bias_path is None:
+        raise ValueError("head weights and bias are required")
+    if input_dim_device is None or output_dim_device is None:
+        raise ValueError("input_dim_device and output_dim_device are required")
+    if input_dim_device % TILE_BLOCK != 0 or output_dim_device % TILE_BLOCK != 0:
+        raise ValueError("device-side input/output widths must be divisible by 8")
 
     num_tiles = num_cols * ROWS_PER_COL
+    if num_tiles < 2:
+        raise ValueError("streaming pipeline requires at least two tiles")
     tile_order = snake_tile_order(num_cols)
     fifo_depth = 1 if stream_depth == 1 else 2
 
@@ -100,190 +106,138 @@ def snake_streaming_pipeline(
         [hidden_ty, hidden_wt_ty, hidden_ty],
     )
 
-    if pipeline == "hybrid":
-        packed_residual_weights = _load_bf16_array(
-            residual_weights_path,
-            (num_tiles, H * H),
-            "packed residual weights",
-        )
-        host_in_dim = H
-        host_out_dim = H
+    residual_tiles = num_tiles - 2
+    packed_residual_weights = _load_bf16_array(
+        residual_weights_path,
+        (residual_tiles, H * H),
+        "packed residual weights",
+    )
+    packed_embed_weights = _load_bf16_array(
+        embed_weights_path,
+        (input_dim_device * H,),
+        "packed embed weights",
+    )
+    packed_embed_bias = _load_bf16_array(
+        embed_bias_path,
+        (H * TILE_BLOCK,),
+        "packed embed bias",
+    )
+    packed_head_weights = _load_bf16_array(
+        head_weights_path,
+        (H * output_dim_device,),
+        "packed head weights",
+    )
+    packed_head_bias = _load_bf16_array(
+        head_bias_path,
+        (output_dim_device * TILE_BLOCK,),
+        "packed head bias",
+    )
 
-        act_in = ObjectFifo(hidden_ty, name="act_in", depth=fifo_depth)
-        act_out = ObjectFifo(hidden_ty, name="act_out", depth=fifo_depth)
-        act_inter = [
-            ObjectFifo(hidden_ty, name=f"act_{i}", depth=fifo_depth)
-            for i in range(num_tiles - 1)
-        ]
+    input_ty = np.ndarray[(B * input_dim_device,), np.dtype[bfloat16]]
+    output_ty = np.ndarray[(B * output_dim_device,), np.dtype[bfloat16]]
+    embed_wt_ty = np.ndarray[(input_dim_device * H,), np.dtype[bfloat16]]
+    embed_bias_ty = np.ndarray[(H * TILE_BLOCK,), np.dtype[bfloat16]]
+    head_wt_ty = np.ndarray[(H * output_dim_device,), np.dtype[bfloat16]]
+    head_bias_ty = np.ndarray[(output_dim_device * TILE_BLOCK,), np.dtype[bfloat16]]
 
-        workers = []
-        for idx, (col, row) in enumerate(tile_order):
-            in_ep = act_in.cons() if idx == 0 else act_inter[idx - 1].cons()
-            out_ep = act_out.prod() if idx == num_tiles - 1 else act_inter[idx].prod()
+    embed_kernel = Kernel(
+        "matmul_bias_embed_bf16",
+        embed_archive_name,
+        [input_ty, embed_wt_ty, embed_bias_ty, hidden_ty],
+    )
+    head_kernel = Kernel(
+        "matmul_bias_head_bf16",
+        head_archive_name,
+        [hidden_ty, head_wt_ty, head_bias_ty, output_ty],
+    )
 
-            weight_buf = Buffer(
-                initial_value=np.array(packed_residual_weights[idx], dtype=np.dtype("bfloat16"), copy=True),
-                name=f"weights_{idx}",
-            )
-            workers.append(
-                Worker(
-                    _residual_worker,
-                    fn_args=[in_ep, out_ep, weight_buf, residual_kernel, stream_depth],
-                    placement=Tile(col=col, row=row),
-                    allocation_scheme="basic-sequential",
-                )
-            )
-    elif pipeline == "full_npu":
-        if num_tiles < 2:
-            raise ValueError("full_npu pipeline requires at least two tiles")
-        if embed_archive_name is None or head_archive_name is None:
-            raise ValueError("full_npu pipeline requires embed and head archive names")
-        if embed_weights_path is None or embed_bias_path is None:
-            raise ValueError("full_npu pipeline requires embed weights and bias")
-        if head_weights_path is None or head_bias_path is None:
-            raise ValueError("full_npu pipeline requires head weights and bias")
-        if input_dim_device is None or output_dim_device is None:
-            raise ValueError("full_npu pipeline requires input_dim_device and output_dim_device")
-        if input_dim_device % TILE_BLOCK != 0 or output_dim_device % TILE_BLOCK != 0:
-            raise ValueError("full_npu device-side input/output widths must be divisible by 8")
+    act_in = ObjectFifo(input_ty, name="act_in", depth=fifo_depth)
+    act_out = ObjectFifo(output_ty, name="act_out", depth=fifo_depth)
+    hidden_fifos = [
+        ObjectFifo(hidden_ty, name=f"act_{i}", depth=fifo_depth)
+        for i in range(residual_tiles + 1)
+    ]
 
-        residual_tiles = num_tiles - 2
-        packed_residual_weights = _load_bf16_array(
-            residual_weights_path,
-            (residual_tiles, H * H),
-            "packed residual weights",
-        )
-        packed_embed_weights = _load_bf16_array(
-            embed_weights_path,
-            (input_dim_device * H,),
-            "packed embed weights",
-        )
-        packed_embed_bias = _load_bf16_array(
-            embed_bias_path,
-            (H * TILE_BLOCK,),
-            "packed embed bias",
-        )
-        packed_head_weights = _load_bf16_array(
-            head_weights_path,
-            (H * output_dim_device,),
-            "packed head weights",
-        )
-        packed_head_bias = _load_bf16_array(
-            head_bias_path,
-            (output_dim_device * TILE_BLOCK,),
-            "packed head bias",
-        )
+    workers = []
 
-        input_ty = np.ndarray[(B * input_dim_device,), np.dtype[bfloat16]]
-        output_ty = np.ndarray[(B * output_dim_device,), np.dtype[bfloat16]]
-        embed_wt_ty = np.ndarray[(input_dim_device * H,), np.dtype[bfloat16]]
-        embed_bias_ty = np.ndarray[(H * TILE_BLOCK,), np.dtype[bfloat16]]
-        head_wt_ty = np.ndarray[(H * output_dim_device,), np.dtype[bfloat16]]
-        head_bias_ty = np.ndarray[(output_dim_device * TILE_BLOCK,), np.dtype[bfloat16]]
-
-        embed_kernel = Kernel(
-            "matmul_bias_embed_bf16",
-            embed_archive_name,
-            [input_ty, embed_wt_ty, embed_bias_ty, hidden_ty],
+    embed_weight_buf = Buffer(
+        initial_value=np.array(packed_embed_weights, dtype=np.dtype("bfloat16"), copy=True),
+        name="embed_weights",
+    )
+    embed_bias_buf = Buffer(
+        initial_value=np.array(packed_embed_bias, dtype=np.dtype("bfloat16"), copy=True),
+        name="embed_bias",
+    )
+    workers.append(
+        Worker(
+            _linear_worker,
+            fn_args=[
+                act_in.cons(),
+                hidden_fifos[0].prod(),
+                embed_weight_buf,
+                embed_bias_buf,
+                embed_kernel,
+                stream_depth,
+            ],
+            placement=Tile(col=tile_order[0][0], row=tile_order[0][1]),
+            allocation_scheme="basic-sequential",
         )
-        head_kernel = Kernel(
-            "matmul_bias_head_bf16",
-            head_archive_name,
-            [hidden_ty, head_wt_ty, head_bias_ty, output_ty],
-        )
+    )
 
-        act_in = ObjectFifo(input_ty, name="act_in", depth=fifo_depth)
-        act_out = ObjectFifo(output_ty, name="act_out", depth=fifo_depth)
-        hidden_fifos = [
-            ObjectFifo(hidden_ty, name=f"act_{i}", depth=fifo_depth)
-            for i in range(residual_tiles + 1)
-        ]
-
-        workers = []
-
-        embed_weight_buf = Buffer(
-            initial_value=np.array(packed_embed_weights, dtype=np.dtype("bfloat16"), copy=True),
-            name="embed_weights",
-        )
-        embed_bias_buf = Buffer(
-            initial_value=np.array(packed_embed_bias, dtype=np.dtype("bfloat16"), copy=True),
-            name="embed_bias",
+    for idx, (col, row) in enumerate(tile_order[1:-1]):
+        weight_buf = Buffer(
+            initial_value=np.array(packed_residual_weights[idx], dtype=np.dtype("bfloat16"), copy=True),
+            name=f"weights_{idx}",
         )
         workers.append(
             Worker(
-                _linear_worker,
+                _residual_worker,
                 fn_args=[
-                    act_in.cons(),
-                    hidden_fifos[0].prod(),
-                    embed_weight_buf,
-                    embed_bias_buf,
-                    embed_kernel,
+                    hidden_fifos[idx].cons(),
+                    hidden_fifos[idx + 1].prod(),
+                    weight_buf,
+                    residual_kernel,
                     stream_depth,
                 ],
-                placement=Tile(col=tile_order[0][0], row=tile_order[0][1]),
+                placement=Tile(col=col, row=row),
                 allocation_scheme="basic-sequential",
             )
         )
 
-        for idx, (col, row) in enumerate(tile_order[1:-1]):
-            weight_buf = Buffer(
-                initial_value=np.array(packed_residual_weights[idx], dtype=np.dtype("bfloat16"), copy=True),
-                name=f"weights_{idx}",
-            )
-            workers.append(
-                Worker(
-                    _residual_worker,
-                    fn_args=[
-                        hidden_fifos[idx].cons(),
-                        hidden_fifos[idx + 1].prod(),
-                        weight_buf,
-                        residual_kernel,
-                        stream_depth,
-                    ],
-                    placement=Tile(col=col, row=row),
-                    allocation_scheme="basic-sequential",
-                )
-            )
-
-        head_weight_buf = Buffer(
-            initial_value=np.array(packed_head_weights, dtype=np.dtype("bfloat16"), copy=True),
-            name="head_weights",
+    head_weight_buf = Buffer(
+        initial_value=np.array(packed_head_weights, dtype=np.dtype("bfloat16"), copy=True),
+        name="head_weights",
+    )
+    head_bias_buf = Buffer(
+        initial_value=np.array(packed_head_bias, dtype=np.dtype("bfloat16"), copy=True),
+        name="head_bias",
+    )
+    workers.append(
+        Worker(
+            _linear_worker,
+            fn_args=[
+                hidden_fifos[-1].cons(),
+                act_out.prod(),
+                head_weight_buf,
+                head_bias_buf,
+                head_kernel,
+                stream_depth,
+            ],
+            placement=Tile(col=tile_order[-1][0], row=tile_order[-1][1]),
+            allocation_scheme="basic-sequential",
         )
-        head_bias_buf = Buffer(
-            initial_value=np.array(packed_head_bias, dtype=np.dtype("bfloat16"), copy=True),
-            name="head_bias",
-        )
-        workers.append(
-            Worker(
-                _linear_worker,
-                fn_args=[
-                    hidden_fifos[-1].cons(),
-                    act_out.prod(),
-                    head_weight_buf,
-                    head_bias_buf,
-                    head_kernel,
-                    stream_depth,
-                ],
-                placement=Tile(col=tile_order[-1][0], row=tile_order[-1][1]),
-                allocation_scheme="basic-sequential",
-            )
-        )
+    )
 
-        host_in_dim = input_dim_device
-        host_out_dim = output_dim_device
-    else:
-        raise ValueError(f"Unsupported pipeline '{pipeline}'")
-
-    host_in_chunk_ty = np.ndarray[(stream_depth, B, host_in_dim), np.dtype[bfloat16]]
-    host_out_chunk_ty = np.ndarray[(stream_depth, B, host_out_dim), np.dtype[bfloat16]]
+    host_in_chunk_ty = np.ndarray[(stream_depth, B, input_dim_device), np.dtype[bfloat16]]
+    host_out_chunk_ty = np.ndarray[(stream_depth, B, output_dim_device), np.dtype[bfloat16]]
 
     rt = Runtime()
     with rt.sequence(host_in_chunk_ty, host_out_chunk_ty) as (inp, out):
         rt.start(*workers)
 
         tg = rt.task_group()
-        rt.fill(act_in.prod(), inp, tap=_stream_tap(stream_depth, B, host_in_dim), task_group=tg)
-        rt.drain(act_out.cons(), out, tap=_stream_tap(stream_depth, B, host_out_dim), wait=True, task_group=tg)
+        rt.fill(act_in.prod(), inp, tap=_stream_tap(stream_depth, B, input_dim_device), task_group=tg)
+        rt.drain(act_out.cons(), out, tap=_stream_tap(stream_depth, B, output_dim_device), wait=True, task_group=tg)
         rt.finish_task_group(tg)
 
     return Program(NPU2(), rt).resolve_program(SequentialPlacer())
@@ -297,17 +251,16 @@ if __name__ == "__main__":
     p.add_argument("--B", type=int, default=8)
     p.add_argument("--cols", type=int, default=8)
     p.add_argument("--stream-depth", type=int, default=32)
-    p.add_argument("--pipeline", choices=("hybrid", "full_npu"), default="hybrid")
     p.add_argument("--residual-archive-name", default="resmlp_streaming_kernel.a")
     p.add_argument("--residual-weights-path", required=True)
-    p.add_argument("--embed-archive-name")
-    p.add_argument("--embed-weights-path")
-    p.add_argument("--embed-bias-path")
-    p.add_argument("--head-archive-name")
-    p.add_argument("--head-weights-path")
-    p.add_argument("--head-bias-path")
-    p.add_argument("--input-dim-device", type=int)
-    p.add_argument("--output-dim-device", type=int)
+    p.add_argument("--embed-archive-name", required=True)
+    p.add_argument("--embed-weights-path", required=True)
+    p.add_argument("--embed-bias-path", required=True)
+    p.add_argument("--head-archive-name", required=True)
+    p.add_argument("--head-weights-path", required=True)
+    p.add_argument("--head-bias-path", required=True)
+    p.add_argument("--input-dim-device", type=int, required=True)
+    p.add_argument("--output-dim-device", type=int, required=True)
     p.add_argument("-o", "--output", default="build/resmlp_streaming.mlir")
     args = p.parse_args()
 
@@ -316,7 +269,6 @@ if __name__ == "__main__":
         B=args.B,
         num_cols=args.cols,
         stream_depth=args.stream_depth,
-        pipeline=args.pipeline,
         residual_archive_name=args.residual_archive_name,
         residual_weights_path=args.residual_weights_path,
         embed_archive_name=args.embed_archive_name,

@@ -43,18 +43,19 @@
 We study a deliberately narrow question: which neural-network shape best
 matches the AMD XDNA~2 NPU for high-throughput, low-latency inference on dense
 collider-style features? We answer it with a forward-only residual MLP whose
-hidden body streams across the 32 compute tiles of the Strix Point array. On
-the public HIGGS benchmark, we retain three key configurations: a host-assisted
-$H=32$, $L=8$ model that sustains about 2.38M samples/s wall-clock, a retrained
-fully on-array $H=32$, $L=30$ model that reaches 76.61\% test accuracy and
-14.08M samples/s wall-clock at $B=64$ (2.44M at the native streaming batch
-$B=8$), and a full-data $H=64$, $L=32$ model trained on 10.4M examples that
-reaches 77.98\% test accuracy, 0.865 ROC AUC, and 0.877 PR AUC on the fixed
-500k-example test split. The design is small enough to understand end to end
-yet strong enough to support a credible systems case for dense event filtering
-on consumer hardware. The contribution is a measured co-designed operating
-regime, not a production trigger deployment, a state-of-the-art HIGGS accuracy
-paper, or an energy-efficiency study.
+input projection, 30 residual blocks, and classifier head all stream across the
+32 compute tiles of the Strix Point array. On the public HIGGS benchmark, this
+fully on-array $H=32$, $L=30$ pipeline reaches 76.61\% test accuracy and
+sustains 14.08M samples/s wall-clock at batch size 64 on the fixed 500k-example
+test split, or 2.44M samples/s at the native streaming batch of 8. On the same
+machine and the same model, a 12-core CPU baseline peaks at 0.98M samples/s,
+so the on-array path is roughly $14\times$ faster at the best CPU operating
+point. The design is
+small enough to understand end to end yet strong enough to support a credible
+systems case for dense event filtering on consumer hardware. The contribution
+is a measured co-designed operating regime, not a production trigger
+deployment, a state-of-the-art HIGGS accuracy paper, or an energy-efficiency
+study.
 \end{abstract}
 
 \section{Introduction}
@@ -84,13 +85,12 @@ trigger must inspect detector data at the 40~MHz bunch-crossing rate, produce
 decisions with a latency budget of about 12.5~$\mu$s, and emit accepted events
 at roughly 750~kHz \cite{cms-phase2-l1}. Those rates explain why
 multi-megasample-per-second measurements are interesting here, but they are not
-used to imply deployment equivalence: the best wall-clock repeated-sample
-result in this paper is 14.08M samples/s at $B=64$ on a fully on-array
-$H=32$, $L=30$ path, while the same model reaches 2.44M samples/s at the native
-$B=8$ streaming batch. Those figures sit above the accepted-event rate yet far
-below the full bunch-crossing stream. The point is to study the same general
-systems regime of dense features, strict latency sensitivity, and pressure for
-very high sustained throughput.
+used to imply deployment equivalence: the wall-clock repeated-sample result in
+this paper is 14.08M samples/s at $B=64$ on a fully on-array $H=32$, $L=30$
+path, which sits above the accepted-event rate yet far below the full
+bunch-crossing stream. The point is to study the same general systems regime
+of dense features, strict latency sensitivity, and pressure for very high
+sustained throughput.
 
 This places the paper next to three adjacent literatures. For HIGGS itself, the
 reference landscape already includes both the original deep-versus-classic
@@ -120,8 +120,8 @@ to host-visible memory and runtime control.
 \centering
 \includegraphics[width=0.92\textwidth]{xdna2_hardware.png}
 \caption{Physical layout of the AMD XDNA~2 NPU used here. The retained design
-can use all 32 compute tiles; the fastest variant uses only 2 columns, while
-the deeper $L=32$ body occupies the full 8-column array.}
+uses all 32 compute tiles: one for the $28 \rightarrow H$ embed, 30 for the
+residual body, and one for the $H \rightarrow 2$ classifier head.}
 \label{fig:xdna-layout}
 \end{figure}
 
@@ -132,7 +132,7 @@ the deeper $L=32$ body occupies the full 8-column array.}
 \toprule
 Property & Why it matters here \\
 \midrule
-32 compute tiles (8 columns $\times$ 4 rows) & Depth maps naturally to tile count; an $L=8$ body uses 2 columns, an $L=32$ body uses the full array. \\
+32 compute tiles (8 columns $\times$ 4 rows) & Depth maps naturally to tile count; the retained deployment uses one tile for the embed, 30 for the residual body, and one for the head. \\
 About 64 KB local SRAM per compute tile \cite{amd-aie,amd-npu-linux} & Parameters must stay small enough to live locally; that strongly constrains hidden width. \\
 8$\times$8 MMUL-friendly blocked execution & Widths and batch sizes should be divisible by 8, and host-side packing must respect tiled layouts. \\
 Explicit FIFOs, DMA, and routing & Data movement is part of the design, not an afterthought hidden behind a cache hierarchy. \\
@@ -147,9 +147,11 @@ memories and explicit data movement.}
 
 These constraints shape the model directly. The hidden body is kept square so
 that each tile stores one $H \times H$ residual weight matrix. Widths are kept
-as multiples of 8 to match the AIE MMUL datapath. The host only moves the data
-that are still cheaper to keep on CPU today: the input projection and, for the
-fastest retained variant, the tiny final $H \rightarrow 2$ classifier head.
+as multiples of 8 to match the AIE MMUL datapath. The retained deployment
+places the entire inference path on the array: the first tile runs a padded
+$32 \rightarrow H$ embed, the next 30 tiles run the residual body, and the last
+tile runs a padded $H \rightarrow 8$ head, leaving only small pad/strip
+operations on the host.
 
 \section{A residual network that matches the array}
 
@@ -172,39 +174,29 @@ $H \times H$ weights).
 The skip connection follows the convention introduced by He et al.~\cite{he-resnet};
 each residual matrix $W_{\ell}$ is assigned to one compute tile. Activations
 enter the array, flow through the tiles in a snake, and return to the host only
-after the full hidden body has completed. In the current deployment path:
+after the full pipeline has completed. In the retained deployment path:
 \begin{itemize}
-  \item the host CPU runs the input projection from the native 28 HIGGS features
-         to hidden width $H$,
-  \item the NPU runs the residual body,
-  \item the host CPU currently keeps the tiny final $H \rightarrow 2$ head when
-         that is faster than the available fused on-array tail.
+  \item the first compute tile runs a padded $32 \rightarrow H$ input projection
+        that maps native 28-feature HIGGS events into the hidden width,
+  \item the next 30 tiles run the residual body, one $H \times H$ matrix per
+        tile,
+  \item the last tile runs a padded $H \rightarrow 8$ classifier head whose
+        first two output columns carry the HIGGS binary logits.
 \end{itemize}
-
-This design leads to two retained operating variants.
-\begin{itemize}
-  \item \textbf{Speed-optimized variant:} $H=32$, $L=8$, mapped to 2 columns. This is
-         the fastest end-to-end HIGGS point measured so far.
-  \item \textbf{Accuracy-tuned variant:} $H=64$, $L=32$, trained on the full public
-         dataset and mapped to the full 8-column array when the deeper body is
-         streamed on the NPU.
-\end{itemize}
-
-The retained paper path keeps the narrow surround on CPU and uses the NPU only
-for the residual streaming body. The same snake-order placement then scales
-from the 2-column $L=8$ speed-optimized variant to the full 8-column $L=32$
-body; Figure~\ref{fig:model-hardware-mapping} makes that deployment contract
+With $H=32$ this fills the full 32-tile array. The host only pads the 28-wide
+input to 32, moves the stacked batch across the shim, and later strips the two
+useful output columns; all matrix multiplies run on the NPU.
+Figure~\ref{fig:model-hardware-mapping} makes that deployment contract
 concrete.
 
 \begin{figure}[t]
 \centering
 \includegraphics[width=\textwidth]{higgs_xdna2_model_hardware_mapping.pdf}
 \caption{Model-to-hardware mapping for the retained HIGGS/XDNA~2 deployment
-path. The host CPU keeps the cheap $28 \rightarrow H$ input projection and, in
-the fastest retained path, the tiny $H \rightarrow 2$ head. The NPU assigns one
-$H \times H$ residual block per compute tile, using 2 columns for the
-$H=32$, $L=8$ speed-optimized variant and the full 8-column array for the deeper
-$L=32$ body.}
+path. The NPU runs the full inference pipeline: one tile for the
+$28 \rightarrow H$ embed, 30 tiles for the $H \times H$ residual body, and one
+tile for the $H \rightarrow 2$ head. The host only pads the input and strips
+the output columns.}
 \label{fig:model-hardware-mapping}
 \end{figure}
 
@@ -215,12 +207,14 @@ simple enough to analyze and direct enough to deploy.
 \section{From Python model to NPU artifact}
 
 The toolchain is deliberately short.
-\path{aie_kernels/matmul_relu_skip.cc} defines the tile-local residual kernel.
-\path{resmlp/streaming_design.py} turns a chosen $(H, B, L)$ shape into a
-spatial-streaming MLIR-AIE program. \path{resmlp/streaming_op.py} wraps the
-compiled XCLBIN and instruction binary as a resident XRT operator. Finally,
-\path{resmlp/streaming_infer.py} drives trained checkpoints through that
-operator and measures wall-clock throughput.
+\path{aie_kernels/matmul_relu_skip.cc} defines the tile-local residual kernel,
+while \path{aie_kernels/matmul_bias.cc} is compiled into two archives for the
+embed and head linear stages. \path{resmlp/streaming_design.py} turns a chosen
+$(H, B, L)$ shape into a spatial-streaming MLIR-AIE program that wires embed,
+residual body, and head into a single snake. \path{resmlp/streaming_op.py}
+wraps the compiled XCLBIN and instruction binary as a resident XRT operator.
+Finally, \path{resmlp/streaming_infer.py} drives trained checkpoints through
+that operator and measures wall-clock throughput.
 
 The novelty claimed here is not a new compiler or runtime. IRON and MLIR-AIE
 already provide the compilation substrate \cite{iron,mlir-aie}; what is new is
@@ -267,22 +261,14 @@ contribution of this work remains systems-oriented.
 \toprule
 Model & Training recipe \\
 \midrule
-$H=32$, $L=8$ full-data pilot &
-5 epochs on the AMD Radeon 890M ROCm path; AdamW, batch 8192, cosine
-$3\times10^{-3} \rightarrow 10^{-4}$, weight decay $10^{-4}$, no label smoothing. \\
-$H=32$, $L=32$ long schedule &
-20 epochs on the AMD Radeon 890M ROCm path; AdamW, batch 8192, cosine
-$3\times10^{-3} \rightarrow 10^{-4}$, weight decay $10^{-4}$, no label smoothing. \\
-$H=64$, $L=32$ validation-selected tuning run &
-Best checkpoint at epoch 46 of a 50-epoch MLflow/Optuna sweep on the AMD
-Radeon 890M ROCm path; AdamW, batch 4096, cosine
-$1.069\times10^{-3} \rightarrow 8.70\times10^{-5}$, weight decay
-$3.23\times10^{-3}$, label smoothing $0.0197$. \\
+$H=32$, $L=30$ full-NPU &
+9 epochs on the AMD Radeon 890M ROCm path; AdamW, batch 8192, cosine
+$3\times10^{-3} \rightarrow 10^{-4}$, weight decay $10^{-4}$, no label
+smoothing. Early-stopping plateau on held-out validation. \\
 \bottomrule
 \end{tabularx}
-\caption{Training recipes for the reported HIGGS checkpoints. Both direct runs
-and validation-driven hyperparameter search were used to produce the reported
-models.}
+\caption{Training recipe for the retained $H=32$, $L=30$ checkpoint that the
+on-array deployment uses end to end.}
 \label{tab:training-protocol}
 \end{table}
 
@@ -290,10 +276,10 @@ models.}
 
 \subsection{Accuracy on the full public HIGGS split}
 
-Table~\ref{tab:higgs-full-results} summarizes the current full-data results.
-The key point is that the systems design is not accuracy-indifferent. Even this
-deliberately hardware-friendly residual MLP becomes a credible classifier once
-it is trained on the full public HIGGS data.
+Table~\ref{tab:higgs-full-results} summarizes the full-data accuracy of the
+retained checkpoint. The key point is that the systems design is not
+accuracy-indifferent: even this deliberately hardware-friendly residual MLP
+becomes a credible classifier once it is trained on the full public HIGGS data.
 
 \begin{table}[t]
 \centering
@@ -302,124 +288,55 @@ it is trained on the full public HIGGS data.
 \toprule
 Model & Test acc. & ROC AUC & PR AUC & Log loss \\
 \midrule
-$H=32$, $L=8$ full-data (5 epochs) & 75.89\% & 0.8430 & 0.8559 & 0.4861 \\
-$H=32$, $L=32$ full-data (5 epochs) & 76.56\% & 0.8502 & 0.8628 & 0.4762 \\
-$H=32$, $L=32$ full-data (20 epochs) & 76.98\% & 0.8542 & 0.8668 & 0.4705 \\
-$H=32$, $L=30$ full-NPU (epoch 9) & 76.61\% & 0.8507 & 0.8635 & 0.4759 \\
-Validation-selected tuning run: $H=64$, $L=32$ & 77.98\% & 0.8653 & 0.8770 & 0.4543 \\
+$H=32$, $L=30$ full-NPU & 76.61\% & 0.8507 & 0.8635 & 0.4759 \\
 \bottomrule
 \end{tabular}
-\caption{Full-data HIGGS results on the public \code{jxie/higgs} mirror.
-Validation-selected tuning at $H=64$, $L=32$ reaches 0.865 ROC AUC while
-remaining within the same residual design family.}
+\caption{Full-data HIGGS results for the retained $H=32$, $L=30$ checkpoint on
+the public \code{jxie/higgs} mirror, evaluated on the fixed 500k-example test
+split.}
 \label{tab:higgs-full-results}
 \end{table}
 
-Two key findings emerge. First, depth helps. Moving from $L=8$ to $L=32$
-improves every metric even before any serious hyperparameter search. Second,
-validation-driven hyperparameter tuning lifts the result from the high-0.85 ROC
-band to 0.865 ROC AUC while also improving accuracy, PR AUC, and log loss.
-This is still not a claim of state-of-the-art HIGGS accuracy, but it is strong
-enough that the main contribution of the paper is no longer
-accuracy-indifferent.
+The retained checkpoint reaches 0.851 ROC AUC on the 500k-example test split.
+That is not a claim of state-of-the-art HIGGS accuracy, but it is firmly inside
+the credible baseline band reported by \cite{baldi-higgs,rtdl-revisiting,grinsztajn-tabular}
+for comparably sized dense models, and it shows that the hardware-friendly
+residual shape is not accuracy-indifferent.
 
 \subsection{Throughput of the spatial-streaming deployment}
 
-Table~\ref{tab:higgs-throughput} reports repeated-sample throughput over 50M
-processed samples on the retained HIGGS checkpoints. The ``sync'' and ``async''
-wall-throughput columns are end to end, including the host input projection,
-host head, all host-visible runtime overheads, and the NPU residual stage. The
-``kernel'' column is measured separately by the benchmarking CLI with an
-isolated dispatch+wait calibration on the same compiled bitstream, so the final
-ratio column quantifies how much of that pure kernel ceiling survives in the
-overlapped async path.
+Table~\ref{tab:higgs-throughput} reports repeated-sample throughput of the
+retained $H=32$, $L=30$ pipeline over 50M processed samples. The wall-throughput
+column is end to end: input padding, stacked DMA into the shim tiles, the
+embed + 30 residual + head stages on the array, the return DMA, and the host
+strip of the two valid output columns. The kernel column is measured separately
+with an isolated dispatch+wait calibration on the same compiled bitstream, so
+the ratio quantifies how much of the pure-kernel ceiling survives end to end.
 
 \begin{table}[t]
 \centering
 \small
 \begin{tabular}{@{}lrrrr@{}}
 \toprule
-Configuration & \multicolumn{2}{c}{Wall throughput} & Kernel throughput & Wall/kernel \\
-\cmidrule(lr){2-3}
- & sync & async & isolated & (async) \\
+Configuration & Batch size & Wall throughput & Kernel throughput & Wall/kernel \\
 \midrule
-$H=32$, $L=8$, 2 columns  & 1.72M & 2.38M & 2.44M & 97\% \\
-$H=32$, $L=32$, 8 columns & 1.64M & 2.25M & 2.27M & 99\% \\
-$H=64$, $L=32$, 8 columns & 0.82M & 1.45M & 1.99M & 73\% \\
+$H=32$, $L=30$ full-NPU & $B=8$  & 2.44M samples/s & 2.48M samples/s & 99\% \\
+$H=32$, $L=30$ full-NPU & $B=64$ & 14.08M samples/s & 14.16M samples/s & 99.6\% \\
 \bottomrule
 \end{tabular}
-\caption{Repeated-sample throughput on the retained HIGGS checkpoints.
-``Sync'' and ``async'' refer only to the host-loop implementation; all columns
-use the same compiled NPU bitstream. ``Kernel throughput'' is measured with a
-separate isolated dispatch+wait calibration rather than inferred from the
-overlapped async loop.}
+\caption{Repeated-sample throughput of the retained fully on-array
+$H=32$, $L=30$ pipeline. The same compiled bitstream scales from 2.44M to
+14.08M samples/s as the streaming batch grows from 8 to 64, and the wall path
+stays within 1\% of the isolated-kernel calibration at both operating points.}
 \label{tab:higgs-throughput}
 \end{table}
 
-\subsubsection{Reducing host-loop overhead with a double-buffered host loop}
-\label{sec:pipeline-overlap}
-
-Earlier revisions of this paper reported that wall throughput was several times
-lower than kernel throughput for every configuration. Instrumenting the host
-loop showed that the gap was dominated by Python per-call overhead: the
-$H=64$, $L=32$ configuration spent roughly 380~\textmu{}s/call on the CPU
-input projection, 64~\textmu{}s/call tiling the activations, 78~\textmu{}s/call
-detiling outputs, and 71~\textmu{}s/call on the CPU head, against only
-156~\textmu{}s/call in kernel wait. Two changes attack this gap without
-changing the NPU kernel or the network itself. First, we replaced 32 small
-Python dispatches per kernel invocation with four stacked numpy operations
-(one embed matmul on all $S \!\times\! B$ rows, one reshape/transpose pack, one
-reshape/transpose detile, one head matmul), which collapses the host work
-from ${\sim}590$\,\textmu{}s/call to roughly 116~\textmu{}s/call on the
-$H=64$, $L=32$ checkpoint. Second, we use two-slot ping-pong device buffers and
-dispatch the next kernel with \texttt{run = xrt\_kernel(\dots{})} before the
-host begins consuming the previous slot's output, so a large fraction of the
-host work overlaps with kernel execution instead of paying the full
-$\text{host}+\text{kernel}$ sum on every iteration.
-
-The corrected measurements now show four different regimes. For the two hybrid
-$H=32$ variants the async host loop materially improves wall throughput over the
-serial baseline and nearly closes the gap to isolated kernel throughput: the
-$L=8$ speed variant rises from 1.72M to 2.38M samples/s and lands at 97\% of
-isolated kernel throughput, while the deeper $H=32$, $L=32$ variant rises from
-1.64M to 2.25M and lands at 99\%. The retrained full-NPU $H=32$, $L=30$ path
-goes one step further by eliminating the CPU embed/head matmuls entirely. At
-$B=8$ it reaches 2.44M samples/s wall-clock and 99\% of isolated kernel
-throughput, a modest but real gain over the host-assisted $H=32$, $L=32$
-baseline. At $B=64$, the same fully on-array graph scales to 14.08M samples/s
-wall-clock while still landing at 99.6\% of isolated kernel throughput. The
-wider $H=64$, $L=32$ accuracy variant also improves substantially---from 0.82M
-to 1.45M samples/s ($+78\%$)---but still reaches only 73\% of isolated kernel
-throughput. There the host path remains a real wall-time cost: the benchmark
-reports about 72~\textmu{}s/call in pre-dispatch host work and 43~\textmu{}s/call
-in post-wait host work against a 128~\textmu{}s/call isolated kernel.
-
-This sharpens the remaining ``NPU-native'' question rather than eliminating it.
-For narrow $H=32$ bodies, moving the input projection and tiny head onto the
-array is now shown to help in two distinct ways: it removes most of the
-host-visible work at $B=8$ and opens a much steeper scaling curve at larger
-batches, where the fully on-array path reaches 14.08M samples/s. For the wider
-$H=64$ configuration, however, host-side work still consumes a substantial
-fraction of the wall path, so further host/runtime optimization or a cleaner
-on-array ingress/egress path for that wider regime could still buy real
-throughput.
-
-Figure~\ref{fig:accuracy-throughput-frontier} combines the retained full-data
-accuracy rows with the measured async wall-throughput rows. It makes the
-trade-off explicit: the retrained full-NPU $H=32$, $L=30$ path is now the
-best-throughput point at the native $B=8$ streaming batch, $H=32$, $L=32$
-trades some speed for slightly better accuracy, and the tuned $H=64$, $L=32$
-run remains the accuracy ceiling, but at 1.45M samples/s wall-clock it sits
-well below the two best $H=32$ variants.
-
-\begin{figure}[t]
-\centering
-\includegraphics[width=\textwidth]{accuracy_throughput_frontier.pdf}
-\caption{Accuracy-throughput frontier for the retained HIGGS/XDNA~2 variants.
-X-axis: test accuracy; Y-axis: wall-clock throughput in M samples/s. Throughput
-is the async/double-buffered measurement from Table~\ref{tab:higgs-throughput}.}
-\label{fig:accuracy-throughput-frontier}
-\end{figure}
+Reaching the multi-megasample regime on this array required more than simply
+compiling the model: an earlier serial host loop left wall throughput at a
+small fraction of the kernel ceiling, and moving the embed and head stages on
+to the array only helped once the host-side overhead had already been
+amortized. We describe those steps in Appendix~\ref{app:path-to-14M} so that
+the main text stays focused on the end-to-end result.
 
 \subsection{CPU throughput baseline}
 
@@ -436,13 +353,14 @@ or frequency governor tuning was applied; the measurements reflect the default
 out-of-the-box configuration.
 
 \paragraph{Methodology.}
-Each benchmark processes 5M samples using random \code{float32} inputs of the
-correct dimensionality ($D=28$). Ten warmup calls precede the timed region.
-The PyTorch path calls \code{model.forward()} under \code{torch.no\_grad()};
-the NumPy path applies the embed, residual chain, and head as explicit
-\code{numpy.matmul} calls, matching the host/NPU split used in the streaming
-deployment. We sweep batch sizes from $B=8$ (matching the NPU's streaming batch)
-through $B=1024$ to show how CPU throughput scales with batch-level parallelism.
+Each benchmark processes 5M samples of the same $H=32$, $L=30$ architecture
+using random \code{float32} inputs ($D=28$). Ten warmup calls precede the
+timed region. The PyTorch path calls \code{model.forward()} under
+\code{torch.no\_grad()}; the NumPy path applies the embed, residual chain, and
+head as explicit \code{numpy.matmul} calls. We sweep batch sizes from $B=8$
+(matching the NPU's native streaming batch) through $B=1024$ to show how CPU
+throughput scales with batch-level parallelism. The model, weights layout, and
+input distribution match the deployed NPU pipeline exactly.
 
 \begin{table}[t]
 \centering
@@ -451,61 +369,38 @@ through $B=1024$ to show how CPU throughput scales with batch-level parallelism.
 \toprule
 Configuration & Batch size & PyTorch CPU & NumPy decomposed \\
 \midrule
-$H=32$, $L=8$ (speed) & $B=8$ & 104k samples/s & 491k samples/s \\
-$H=32$, $L=8$ (speed) & $B=256$ & 1.82M samples/s & 3.41M samples/s \\
-$H=32$, $L=8$ (speed) & $B=1024$ & 3.27M samples/s & 1.73M samples/s \\
-\midrule
-$H=64$, $L=32$ (accuracy) & $B=8$ & 28k samples/s & 105k samples/s \\
-$H=64$, $L=32$ (accuracy) & $B=256$ & 352k samples/s & 197k samples/s \\
-$H=64$, $L=32$ (accuracy) & $B=1024$ & 598k samples/s & 234k samples/s \\
+$H=32$, $L=30$ & $B=8$    & 28k samples/s  & 147k samples/s \\
+$H=32$, $L=30$ & $B=64$   & 192k samples/s & 613k samples/s \\
+$H=32$, $L=30$ & $B=256$  & 507k samples/s & 976k samples/s \\
+$H=32$, $L=30$ & $B=1024$ & 918k samples/s & 336k samples/s \\
 \bottomrule
 \end{tabular}
-\caption{CPU throughput baseline for the same model architectures, measured on
-the AMD Ryzen AI 9 HX 370 host (12 cores) used for all NPU experiments. PyTorch
-uses 12 intra-op threads; NumPy uses OpenBLAS with default threading. All runs
-process 5M samples with random \code{float32} inputs.}
+\caption{CPU throughput baseline for the exact retained $H=32$, $L=30$
+architecture, measured on the AMD Ryzen AI 9 HX 370 host (12 cores) used for
+all NPU experiments. PyTorch uses 12 intra-op threads; NumPy uses OpenBLAS
+with default threading. All runs process 5M samples with random
+\code{float32} inputs.}
 \label{tab:cpu-baseline}
 \end{table}
 
-\begin{table}[t]
-\centering
-\small
-\begin{tabular}{@{}lrrrr@{}}
-\toprule
-Configuration & Batch size & Sync wall & Async wall & Kernel \\
-\midrule
-$H=32$, $L=30$ full-NPU & $B=8$ & 1.93M & 2.44M & 2.48M \\
-$H=32$, $L=30$ full-NPU & $B=64$ & 8.34M & 14.08M & 14.16M \\
-\bottomrule
-\end{tabular}
-\caption{Batch-scaling of the retrained fully on-array $H=32$, $L=30$ path.
-At the native streaming batch ($B=8$), moving embed/head on-array yields a
-modest wall-throughput gain over the hybrid $H=32$, $L=32$ path; at larger
-batches the same graph scales to 14.08M~samples/s while remaining very close to
-its isolated kernel throughput.}
-\label{tab:full-npu-batch-scaling}
-\end{table}
+Two patterns are worth noting. First, the CPU strongly favors large batches:
+PyTorch throughput improves by more than $30\times$ going from $B=8$ to
+$B=1024$, because larger batches amortize per-call dispatch overhead and
+expose enough work for BLAS multi-threading. Second, the NumPy decomposed
+path is faster than PyTorch at small-to-mid batches (lower per-call overhead)
+but degrades at $B=1024$ where cache pressure from the $L=30$ residual chain
+outweighs the parallelism gain, while PyTorch's fused ATen kernels keep
+scaling.
 
-Several patterns are worth noting. First, the CPU strongly favors large batch
-sizes: PyTorch throughput on the speed variant improves by $\sim31\times$ going
-from $B=8$ to $B=1024$, because larger batches amortize per-call dispatch
-overhead and expose enough work for BLAS multi-threading. At $B=8$, the
-$32\times32$ matmuls are too small for OpenBLAS to distribute across cores, and
-PyTorch's per-layer dispatch adds measurable overhead; at larger batch sizes,
-OpenBLAS saturates the 12 available threads and PyTorch's fused ATen kernels
-pay off. Second, the NumPy decomposed path is faster than PyTorch at small batch
-sizes (lower per-call overhead) but slower at large batch sizes where PyTorch's
-internal parallelism dominates.
-
-Third, and most relevant to the NPU comparison: at the NPU's native streaming
-batch size of $B=8$, the CPU reaches only 104k~samples/s (PyTorch) for the
-speed variant---roughly $23\times$ slower than the hybrid NPU path's
-2.38M~samples/s wall-clock throughput and $23.5\times$ slower than the retrained
-fully on-array path's 2.44M~samples/s. Even at the CPU's best batch size
-($B=1024$), the peak of 3.27M samples/s is still far below the full-NPU
-$B=64$ result of 14.08M~samples/s. For the accuracy variant ($H=64$, $L=32$),
-the NPU retains a clear advantage: the CPU peaks at 598k~samples/s versus the
-NPU's 1.45M~samples/s wall-clock, a $2.4\times$ factor.
+Most relevant to the NPU comparison: at the NPU's native streaming batch size
+of $B=8$, the CPU reaches only 147k samples/s at best, while the on-array
+pipeline sustains 2.44M samples/s---a $\sim\!17\times$ factor in the NPU's
+favor. At each side's best operating point, the CPU tops out at 976k
+samples/s while the NPU scales to 14.08M samples/s at $B=64$---a
+$\sim\!14\times$ factor, on the identical model. Within the same commodity
+chip, pushing the entire residual pipeline onto the on-die array therefore
+yields more than an order-of-magnitude throughput advantage over the 12 host
+cores.
 
 \paragraph{Note.}
 Both the CPU baseline and the NPU throughput measurements were obtained on the
@@ -518,83 +413,50 @@ in whether the residual body runs on the host cores or the on-die NPU array.
 The claim is deliberately narrow but defensible.
 \begin{itemize}
   \item A residual MLP can be shaped to match the AMD XDNA~2 array very
-        directly: one residual matrix per tile, streamed activations, explicit
-        routing, and checkpoint-specific resident weights.
-  \item That design already delivers multi-million-sample-per-second inference on
-        a real collider-style dense benchmark using cheap consumer hardware,
-        culminating in 14.08M samples/s on a retrained fully on-array
-        $H=32$, $L=30$ path.
-  \item The same design family also reaches nontrivial full-data HIGGS quality,
-        culminating in 77.98\% test accuracy and 0.865 ROC AUC on the fixed
-        500k-example test set.
+        directly: one embed + 30 $H \times H$ residual + one head linear, each
+        on its own compute tile, with streamed activations, explicit routing,
+        and checkpoint-specific resident weights.
+  \item That design delivers 14.08M~samples/s wall-clock at $B=64$ on a real
+        collider-style dense benchmark using consumer hardware, while reaching
+        99.6\% of the isolated kernel-throughput ceiling.
+  \item On the same machine and the identical model, the 12-core CPU peaks at
+        0.98M~samples/s, so moving the full pipeline onto the on-die array
+        yields roughly a $14\times$ throughput advantage without any change in
+        compute substrate.
+  \item The same design reaches 76.61\% test accuracy and 0.851 ROC AUC on the
+        fixed 500k-example test split, enough to place it inside the credible
+        HIGGS baseline band rather than leaving accuracy as a loose end.
 \end{itemize}
 
 Just as importantly, the paper avoids claims it does not need. It does not
-present the current model as a production trigger deployment, the current HIGGS
-result as state of the art, or the present measurements as an energy-efficiency
-study. The benchmark is
-public, the hardware is existing AMD XDNA~2, and the compiler/runtime substrate
-is pre-existing; none of those ingredients are introduced here. The novelty is
-the co-designed operating regime: a residual MLP whose hidden-body geometry
-matches the array closely enough that explicit spatial deployment yields both a
-useful throughput result and a statistically credible HIGGS checkpoint.
-
-A useful boundary from the SRAM accounting is that wider hidden bodies and
-wider surrounding inputs do not stress the current deployment in the same way.
-For the present $B=8$ spatial-streaming layout, an internal residual tile carries
-roughly $1024 + 2H^2 + 32H$ bytes, while the ingress tile carries
-$1024 + 2H^2 + 64H$ because it must hold both the host-ingress buffers and the
-first residual stage. That makes the first tile, not the middle of the belt,
-the width bottleneck. The retained layout still fits at $H=160$ with about
-62.5~KB live on the ingress tile, but the same accounting already pushes
-$H=168$ past 64~KB there even though the internal tiles would still fit. In the
-current paper, then, widening the hidden body is a genuine tile-SRAM limit of
-the current spatial-streaming placement.
-
-The surrounding stages are different. For the native 28-feature HIGGS input,
-even a padded $32 \rightarrow H$ input projection carries only $64H$ bytes of
-bf16 weights (4~KB at $H=64$, 10~KB at $H=160$), so keeping that stage on CPU
-today should not be read as evidence of an SRAM bottleneck. The awkward
-part is that 28 inputs do not naturally match the 8$\times$8 MMUL granularity,
-so an on-array ingress path must pay packing, alignment, and boundary-management
-costs. The same distinction is even clearer for the tiny $H \rightarrow 2$
-head: its weight footprint is negligible, and the measured slowdown of the
-fused NPU head is best understood as synchronization and launch overhead. This
-keeps the scope narrow. Within the HIGGS-style feature regime studied here,
-wider surrounding inputs mainly stress alignment and runtime boundaries,
-whereas the hard SRAM wall comes from widening the hidden body under the
-present first-tile layout.
+present the current model as a production trigger deployment, the current
+HIGGS result as state of the art, or the present measurements as an
+energy-efficiency study. The benchmark is public, the hardware is existing
+AMD XDNA~2, and the compiler/runtime substrate is pre-existing; none of those
+ingredients are introduced here. The novelty is the co-designed operating
+regime: a residual MLP whose full forward path --- embed, residual body,
+and classifier head --- maps cleanly onto the 32-tile array so that every
+matrix multiply in inference runs on the NPU.
 
 \section{Conclusion and next steps}
 
 The main result is simple: a network designed for spatial compute on AMD
 XDNA~2 can deliver unusually high throughput on real dense-event
 classification while remaining small enough to understand and validate end to
-end. The model family is deliberately modest, but it maps cleanly to the array
-and now yields three concrete operating points: a host-assisted speed path,
-a fully on-array $H=32$, $L=30$ path that reaches 14.08M~samples/s, and a
-nontrivial full-data $H=64$, $L=32$ HIGGS result.
+end. The retained model is a fully on-array $H=32$, $L=30$ residual MLP that
+sustains 14.08M~samples/s at $B=64$, stays within 1\% of its own kernel
+ceiling, and reaches a credible 76.61\% test accuracy.
 
-What exists today is a measured prototype family spanning both host-assisted and
-fully on-array inference paths; energy-efficiency characterization remains
-future work.
-
-The next steps are correspondingly focused. The double-buffered host loop
-(\S\ref{sec:pipeline-overlap}) already removes a large fraction of the earlier
-serial host overhead and materially improves end-to-end wall throughput. The
-new measurements now show a split outcome: for narrow $H=32$ bodies, a
-fully on-array ingress/egress path is worthwhile and scales especially well at
-larger batches, while the wider $H=64$ accuracy model still leaves substantial
-wall time on the host side and has not yet been retrained in a corresponding
-full-NPU form. In parallel, genuine kernel-side gains remain valuable:
-increasing stream depth up to the per-DMA descriptor limit, overlapping the
-D2H of one chunk with the H2D of the next, or revisiting the MMUL tiling so
-that more compute is packed into each kernel invocation. The SRAM-sensitive
-scaling question is different: wider hidden bodies will require revisiting the
-first-tile ingress layout because that tile reaches the 64~KB ceiling before
-the internal tiles do. The highest-leverage next modeling step is to test
-whether the full-NPU ingress/egress strategy that works well for $H=32$ can be
-extended profitably to the more accurate $H=64$, $L=32$ regime.
+The next steps are correspondingly focused. The most direct modeling lever is
+to push the on-array model harder on accuracy: longer training schedules,
+stronger regularization, and mild architectural tweaks that preserve the
+32-tile footprint. On the systems side, genuine kernel-side gains remain
+valuable: increasing stream depth toward the per-DMA descriptor limit,
+overlapping the device-to-host transfer of one chunk with the host-to-device
+transfer of the next, or revisiting the MMUL tiling so that more compute is
+packed into each kernel invocation. Energy-efficiency characterization also
+remains future work. Those are refinements of an already measured pipeline
+rather than structural changes.
 
 \clearpage
 \appendix
@@ -649,6 +511,75 @@ XCLBIN / XRT & The compiled device artifact and the runtime that loads and launc
 the main text.}
 \label{tab:npu-glossary}
 \end{table}
+
+\FloatBarrier
+\clearpage
+\section{The path to 14M samples/s}
+\label{app:path-to-14M}
+
+The 14.08M samples/s result in Section~5.2 is the output of a short sequence
+of host-side and graph-side changes, not of a single compilation. We record
+them here so that a reader interested in reproducing or extending the
+measurement can see which ingredients mattered.
+
+\paragraph{Baseline gap.} An earlier revision of this pipeline used a strictly
+serial host loop and ran the embed and classifier head on the CPU. Wall-clock
+throughput was several times lower than the isolated kernel throughput of the
+same compiled bitstream. Instrumenting the host loop showed that the gap was
+dominated by Python per-call overhead. For an earlier hybrid $H=64$, $L=32$
+configuration, one kernel invocation spent roughly 380~\textmu{}s on the CPU
+input projection, 64~\textmu{}s tiling activations, 78~\textmu{}s detiling the
+output, and 71~\textmu{}s on the CPU head, against only 156~\textmu{}s in the
+kernel wait itself. The host was the bottleneck, not the array.
+
+\paragraph{Collapse the host loop into stacked numpy.} The first change replaced
+32 small per-layer Python dispatches per kernel invocation with four stacked
+numpy operations: one matmul on all $S \!\times\! B$ rows for the embed, one
+reshape/transpose pack, one reshape/transpose detile, and (where still needed)
+one stacked head matmul. On the same $H=64$, $L=32$ checkpoint this collapsed
+the measured host work from $\sim\!590$~\textmu{}s/call to roughly
+116~\textmu{}s/call without touching either the NPU kernel or the network.
+
+\paragraph{Double-buffered host/NPU overlap.} The second change exploited the
+fact that the host work and kernel wait are independent: a compiled bitstream
+does not care whether the host is already preparing the next chunk. We allocate
+two device buffer slots per kernel and run a small producer/consumer loop. At
+steady state the host prepares chunk $N{+}1$ (embed, pack, write\_buffer, H2D
+sync) into one slot while the NPU is still running chunk $N$ on the other slot;
+the post-wait side of the loop then consumes chunk $N$'s output, again in
+parallel with the next kernel. Wall time per call becomes close to
+$\max(\text{host}, \text{kernel})$ rather than their sum.
+
+\paragraph{Calibrate the kernel separately.} The overlapped loop makes the
+per-iteration \texttt{dispatch+wait} interval no longer a clean kernel-time
+measurement: it reports whatever the slower side of the pipeline happens to
+be. We therefore measure kernel throughput with a dedicated isolated
+dispatch+wait calibration on the same compiled bitstream. The ratio between
+async wall-clock throughput and that isolated kernel throughput then
+quantifies how much of the pure-kernel ceiling the host loop gives back.
+
+\paragraph{Move the entire pipeline on-array.} With host overhead already
+amortized, the remaining wall-time cost was the two CPU matmuls that still
+bracketed the kernel: the $28 \rightarrow H$ embed and the $H \rightarrow 2$
+head. Moving them on-array required shrinking the residual body from 32 to 30
+layers so that one tile could host each of the new linear stages. The embed and
+head are implemented by a single shared \code{matmul\_bias.cc} kernel compiled
+twice with different $(K, N)$ defines, producing two per-stage archives, and
+wired into the same snake as the residual body. Because the array now runs the
+entire forward pass, host work collapses to zero-padding the 28-wide input to
+32 and stripping the two valid columns out of the 8-wide head output.
+
+\paragraph{Scale the streaming batch.} With the full pipeline on-array, the
+remaining lever is arithmetic intensity. Going from $B=8$ to $B=64$ packs
+$8\times$ more work into each kernel invocation at identical host overhead and
+still fits in the $\sim\!64$~KB tile SRAM budget at $H=32$. This is the change
+that turns the 2.44M samples/s figure into 14.08M samples/s, because at $B=8$
+the retained pipeline is already within 1\% of kernel-limited and the only way
+to go faster is to move the kernel-time ceiling itself.
+
+None of these steps change the learned model: the same 76.61\%-accuracy
+checkpoint is used throughout. They change the artifact that is actually
+dispatched and the way it is dispatched.
 
 \FloatBarrier
 \clearpage

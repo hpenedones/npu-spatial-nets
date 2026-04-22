@@ -6,8 +6,8 @@ Architecture:
     [y = relu(x @ W_i) + x]  × N layers   (NPU)
     H → Linear → C classes
 
-    The number of residual layers is configurable so the same class can model
-    both the 32-layer hybrid pipeline and the 30-layer full-NPU pipeline.
+    The number of residual layers is configurable; the full-NPU pipeline uses
+    30 residual layers so embed and head each get one of the 32 NPU tiles.
 """
 
 import numpy as np

@@ -24,10 +24,7 @@ from resmlp.streaming_op import StreamingResMLP
 
 
 class HiggsStreamingInferenceService:
-    """Host-facing streaming service for the hybrid or full-NPU HIGGS pipeline."""
-
-    HYBRID_PIPELINE = "hybrid"
-    FULL_NPU_PIPELINE = "full_npu"
+    """Host-facing streaming service for the full-NPU HIGGS pipeline."""
 
     def __init__(
         self,
@@ -45,11 +42,10 @@ class HiggsStreamingInferenceService:
             raise ValueError(f"This curated branch only supports HIGGS checkpoints, got '{dataset}'")
 
         self.dataset = "higgs"
-        self.pipeline = self._normalize_pipeline(ckpt.get("pipeline", self.HYBRID_PIPELINE))
         self.B = batch_size
-        self.hidden_dim = hidden_dim if hidden_dim is not None else ckpt.get("hidden_dim", 64)
-        self.num_layers = num_layers if num_layers is not None else ckpt.get("num_layers", 32)
-        required_tiles = self.num_layers + (2 if self.pipeline == self.FULL_NPU_PIPELINE else 0)
+        self.hidden_dim = hidden_dim if hidden_dim is not None else ckpt.get("hidden_dim", 32)
+        self.num_layers = num_layers if num_layers is not None else ckpt.get("num_layers", 30)
+        required_tiles = self.num_layers + 2
         self.num_cols = num_cols if num_cols is not None else math.ceil(required_tiles / ROWS_PER_COL)
         self.num_tiles = self.num_cols * ROWS_PER_COL
         self.stream_depth = stream_depth
@@ -69,14 +65,9 @@ class HiggsStreamingInferenceService:
             raise ValueError(f"batch_size must be divisible by 8, got {self.B}")
         if self.hidden_dim % 8 != 0:
             raise ValueError(f"hidden_dim must be divisible by 8, got {self.hidden_dim}")
-        if self.pipeline == self.HYBRID_PIPELINE and self.num_layers != self.num_tiles:
+        if self.num_layers != self.num_tiles - 2:
             raise ValueError(
-                f"Checkpoint uses {self.num_layers} residual layers, but {self.num_cols} columns provide "
-                f"{self.num_tiles} tiles. Choose num_cols so they match exactly."
-            )
-        if self.pipeline == self.FULL_NPU_PIPELINE and self.num_layers != self.num_tiles - 2:
-            raise ValueError(
-                f"Full-NPU checkpoint uses {self.num_layers} residual layers, but {self.num_cols} columns "
+                f"Checkpoint uses {self.num_layers} residual layers, but {self.num_cols} columns "
                 f"provide {self.num_tiles} tiles; expected residual layers == tiles - 2."
             )
         if self.residual_bias:
@@ -86,16 +77,8 @@ class HiggsStreamingInferenceService:
                 f"This curated branch expects binary HIGGS checkpoints, got {self.num_classes} classes"
             )
 
-        self.npu_input_dim = (
-            self.hidden_dim
-            if self.pipeline == self.HYBRID_PIPELINE
-            else round_up_to_tile_multiple(self.input_dim)
-        )
-        self.npu_output_dim = (
-            self.hidden_dim
-            if self.pipeline == self.HYBRID_PIPELINE
-            else round_up_to_tile_multiple(self.num_classes)
-        )
+        self.npu_input_dim = round_up_to_tile_multiple(self.input_dim)
+        self.npu_output_dim = round_up_to_tile_multiple(self.num_classes)
 
         self.model = ResMLP(
             hidden_dim=self.hidden_dim,
@@ -112,30 +95,15 @@ class HiggsStreamingInferenceService:
             [np.asarray(to_tiled(weight), dtype=bfloat16) for weight in residual_weights]
         )
 
-        self.embed_weight_np = None
-        self.embed_bias_np = None
-        self.cpu_head_weight = None
-        self.cpu_head_bias = None
-        self.packed_embed_weight = None
-        self.packed_embed_bias = None
-        self.packed_head_weight = None
-        self.packed_head_bias = None
+        embed_weight = self.model.export_embed_weight(padded_input_dim=self.npu_input_dim)
+        embed_bias = self.model.export_embed_bias()
+        head_weight = self.model.export_head_weight(padded_classes=self.npu_output_dim)
+        head_bias = self.model.export_head_bias(padded_classes=self.npu_output_dim)
 
-        if self.pipeline == self.HYBRID_PIPELINE:
-            self.embed_weight_np = self.model.embed.weight.detach().cpu().float().numpy()
-            self.embed_bias_np = self.model.embed.bias.detach().cpu().float().numpy()
-            self.cpu_head_weight = self.model.head.weight.detach().cpu().float().numpy()
-            self.cpu_head_bias = self.model.head.bias.detach().cpu().float().numpy()
-        else:
-            embed_weight = self.model.export_embed_weight(padded_input_dim=self.npu_input_dim)
-            embed_bias = self.model.export_embed_bias()
-            head_weight = self.model.export_head_weight(padded_classes=self.npu_output_dim)
-            head_bias = self.model.export_head_bias(padded_classes=self.npu_output_dim)
-
-            self.packed_embed_weight = np.asarray(to_tiled(embed_weight), dtype=bfloat16)
-            self.packed_embed_bias = self._pack_bias_vector(embed_bias)
-            self.packed_head_weight = np.asarray(to_tiled(head_weight), dtype=bfloat16)
-            self.packed_head_bias = self._pack_bias_vector(head_bias)
+        self.packed_embed_weight = np.asarray(to_tiled(embed_weight), dtype=bfloat16)
+        self.packed_embed_bias = self._pack_bias_vector(embed_bias)
+        self.packed_head_weight = np.asarray(to_tiled(head_weight), dtype=bfloat16)
+        self.packed_head_bias = self._pack_bias_vector(head_bias)
 
         ctx = AIEContext(use_runlist=False)
         self.npu_op = StreamingResMLP(
@@ -145,7 +113,6 @@ class HiggsStreamingInferenceService:
             num_cols=self.num_cols,
             stream_depth=self.stream_depth,
             context=ctx,
-            pipeline=self.pipeline,
             input_dim=self.input_dim,
             output_dim=self.num_classes,
             packed_embed_weight=self.packed_embed_weight,
@@ -157,23 +124,10 @@ class HiggsStreamingInferenceService:
         ctx.prepare_runtime()
 
     @staticmethod
-    def _normalize_pipeline(pipeline):
-        if pipeline == "full":
-            return HiggsStreamingInferenceService.FULL_NPU_PIPELINE
-        return pipeline
-
-    @staticmethod
     def _pack_bias_vector(bias):
         bias = np.asarray(bias, dtype=bfloat16)
         tiled = np.broadcast_to(bias, (TILE_BLOCK, bias.shape[0])).copy()
         return np.asarray(to_tiled(tiled), dtype=bfloat16)
-
-    def _embed_stacked(self, features_SBD):
-        """(S, B, D) float32 → (S, B, H) bf16 via a single (S*B, D)·(D, H) matmul."""
-        S = self.stream_depth
-        flat = features_SBD.reshape(S * self.B, self.input_dim)
-        hidden = flat @ self.embed_weight_np.T + self.embed_bias_np
-        return hidden.astype(bfloat16).reshape(S, self.B, self.hidden_dim)
 
     def _pad_features_stacked(self, features_SBD):
         """(S, B, D) float32 → (S, B, D_padded) bf16 for the full-NPU path."""
@@ -202,25 +156,13 @@ class HiggsStreamingInferenceService:
             .astype(np.float32)
         )
 
-    def _head_stacked(self, hidden_SBH_f32):
-        """(S, B, H) float32 hidden → (S, B, C) float32 logits in one matmul."""
-        S, B, H = hidden_SBH_f32.shape
-        flat = hidden_SBH_f32.reshape(S * B, H)
-        logits = flat @ self.cpu_head_weight.T + self.cpu_head_bias
-        return logits.reshape(S, B, self.num_classes)
-
     @staticmethod
     def _add_timing(timings, key, elapsed):
         if timings is not None:
             timings[key] = timings.get(key, 0.0) + elapsed
 
     def _prepare_packed_input(self, features_SBD, timings=None):
-        if self.pipeline == self.HYBRID_PIPELINE:
-            embed_t0 = time.perf_counter()
-            tensor_SBK = self._embed_stacked(features_SBD)
-            self._add_timing(timings, "cpu_embed_s", time.perf_counter() - embed_t0)
-        else:
-            tensor_SBK = self._pad_features_stacked(features_SBD)
+        tensor_SBK = self._pad_features_stacked(features_SBD)
 
         pack_t0 = time.perf_counter()
         packed_input = self._pack_stacked(tensor_SBK)
@@ -231,12 +173,6 @@ class HiggsStreamingInferenceService:
         detile_t0 = time.perf_counter()
         tensor_SBK = self._detile_stacked(flat_output, self.npu_output_dim)
         self._add_timing(timings, "detile_s", time.perf_counter() - detile_t0)
-
-        if self.pipeline == self.HYBRID_PIPELINE:
-            head_t0 = time.perf_counter()
-            logits_SBC = self._head_stacked(tensor_SBK)
-            self._add_timing(timings, "head_s", time.perf_counter() - head_t0)
-            return logits_SBC
 
         return tensor_SBK[..., : self.num_classes].astype(np.float32)
 
@@ -384,11 +320,11 @@ class HiggsStreamingInferenceService:
 
         host_prepare_s = sum(
             timings.get(key, 0.0)
-            for key in ("cpu_embed_s", "pack_s", "write_buffer_s", "h2d_sync_s")
+            for key in ("pack_s", "write_buffer_s", "h2d_sync_s")
         )
         host_consume_s = sum(
             timings.get(key, 0.0)
-            for key in ("d2h_sync_s", "read_buffer_s", "detile_s", "head_s")
+            for key in ("d2h_sync_s", "read_buffer_s", "detile_s")
         )
 
         result = {
@@ -397,7 +333,6 @@ class HiggsStreamingInferenceService:
             "calls": calls,
             "wall_s": wall_s,
             "kernel_s": kernel_s,
-            "cpu_embed_s": timings.get("cpu_embed_s", 0.0),
             "host_prepare_s": host_prepare_s,
             "host_consume_s": host_consume_s,
             "host_total_s": host_prepare_s + host_consume_s,
@@ -412,7 +347,6 @@ class HiggsStreamingInferenceService:
             "d2h_sync_s",
             "read_buffer_s",
             "detile_s",
-            "head_s",
         ):
             result[key] = timings.get(key, 0.0)
         return result
@@ -470,7 +404,7 @@ def main():
         stream_depth=args.stream_depth,
     )
     print(
-        f"  dataset={service.dataset}, pipeline={service.pipeline}, epoch={service.epoch}, "
+        f"  dataset={service.dataset}, epoch={service.epoch}, "
         f"saved {service.eval_split} acc={service.saved_eval_acc}"
     )
     print(
@@ -512,14 +446,12 @@ def main():
         calls = stats["calls"]
         print("\nPer-call breakdown (µs):")
         stage_keys = [
-            ("cpu_embed_s", "cpu_embed"),
             ("pack_s", "pack(to_tiled)"),
             ("write_buffer_s", "write_buffer"),
             ("h2d_sync_s", "h2d_sync(DMA)"),
             ("d2h_sync_s", "d2h_sync(DMA)"),
             ("read_buffer_s", "read_buffer"),
             ("detile_s", "detile(from_tiled)"),
-            ("head_s", "cpu_head"),
         ]
         for key, label in stage_keys:
             us_per_call = stats[key] / calls * 1e6
