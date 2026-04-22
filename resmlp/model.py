@@ -18,7 +18,7 @@ import torch.nn as nn
 class ResidualLinear(nn.Module):
     """One residual layer:  y = relu(x @ W) + x"""
 
-    def __init__(self, dim, *, bias=False):
+    def __init__(self, dim, *, bias=False, init_scale=0.1):
         super().__init__()
         self.weight = nn.Parameter(torch.empty(dim, dim))
         if bias:
@@ -28,7 +28,7 @@ class ResidualLinear(nn.Module):
         nn.init.kaiming_normal_(self.weight, nonlinearity='relu')
         # Scale down to prevent activation explosion across 32 layers
         with torch.no_grad():
-            self.weight.mul_(0.1)
+            self.weight.mul_(init_scale)
 
     def forward(self, x):
         y = x @ self.weight
@@ -47,13 +47,28 @@ class ResMLP(nn.Module):
         input_dim: Input feature dimension (e.g. 28 for native HIGGS features).
     """
 
-    def __init__(self, hidden_dim=160, num_layers=32,
-                 num_classes=10, input_dim=784, residual_bias=False):
+    def __init__(
+        self,
+        hidden_dim=160,
+        num_layers=32,
+        num_classes=10,
+        input_dim=784,
+        residual_bias=False,
+        residual_init_scale=0.1,
+    ):
         super().__init__()
         self.residual_bias = residual_bias
+        self.residual_init_scale = residual_init_scale
         self.embed = nn.Linear(input_dim, hidden_dim)
         self.layers = nn.ModuleList(
-            [ResidualLinear(hidden_dim, bias=residual_bias) for _ in range(num_layers)]
+            [
+                ResidualLinear(
+                    hidden_dim,
+                    bias=residual_bias,
+                    init_scale=residual_init_scale,
+                )
+                for _ in range(num_layers)
+            ]
         )
         self.head = nn.Linear(hidden_dim, num_classes)
 

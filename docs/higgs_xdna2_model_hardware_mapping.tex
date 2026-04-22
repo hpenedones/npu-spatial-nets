@@ -55,29 +55,31 @@
 
 \begin{document}
 \begin{tikzpicture}[line cap=round, line join=round]
-  \node[basebox, minimum width=2.0cm] (input) at (1.35, 6.9) {HIGGS features\\\textbf{28 floats}};
-  \node[cpubox, minimum width=2.45cm] (embed) at (4.0, 6.9) {Host CPU\\\textbf{embed $28 \rightarrow H$}};
-  \node[bodybox] (b1) at (6.65, 6.9) {Block 1\\Tile 1};
-  \node[bodybox] (b2) at (8.35, 6.9) {Block 2\\Tile 2};
-  \node[font=\Large, text=textgray] (dots) at (9.8, 6.9) {$\cdots$};
-  \node[bodybox] (bl) at (11.35, 6.9) {Block $L$\\Tile $L$};
-  \node[cpubox, minimum width=2.65cm] (headcpu) at (14.35, 6.9) {Host CPU\\\textbf{head $H \rightarrow 2$}\\fastest path today};
-  \node[basebox, minimum width=1.9cm] (output) at (16.95, 6.9) {Signal /\\background};
-  \node[optionalbox] (headnpu) at (14.35, 5.32) {Optional on-NPU\\tail + head\\(currently slower)};
+  \node[basebox, minimum width=2.0cm] (input) at (1.25, 6.9) {HIGGS features\\\textbf{28 floats}};
+  \node[cpubox, minimum width=2.45cm] (pad) at (3.9, 6.9) {Host shim\\pad $28 \rightarrow 32$};
+  \node[bodybox, minimum width=1.55cm] (embed) at (6.35, 6.9) {Embed\\Tile 1};
+  \node[bodybox, minimum width=1.55cm] (b1) at (8.0, 6.9) {Residual 1\\Tile 2};
+  \node[bodybox, minimum width=1.55cm] (b2) at (9.65, 6.9) {Residual 2\\Tile 3};
+  \node[font=\Large, text=textgray] (dots) at (11.05, 6.9) {$\cdots$};
+  \node[bodybox, minimum width=1.75cm] (bl) at (12.65, 6.9) {Residual 30\\Tile 31};
+  \node[bodybox, minimum width=1.55cm] (headnpu) at (14.55, 6.9) {Head\\Tile 32};
+  \node[cpubox, minimum width=2.25cm] (strip) at (17.0, 6.9) {Host shim\\strip $8 \rightarrow 2$};
+  \node[basebox, minimum width=1.9cm] (output) at (19.25, 6.9) {Signal /\\background};
 
-  \draw[->, thick] (input) -- (embed);
+  \draw[->, thick] (input) -- (pad);
+  \draw[->, thick] (pad) -- (embed);
   \draw[->, thick] (embed) -- (b1);
   \draw[->, thick] (b1) -- (b2);
   \draw[->, thick] (b2) -- (dots);
   \draw[->, thick] (dots) -- (bl);
-  \draw[->, thick] (bl) -- (headcpu);
-  \draw[->, thick] (headcpu) -- (output);
-  \draw[->, thick, dashed, optionaldraw] (bl.south east) |- (headnpu.west);
+  \draw[->, thick] (bl) -- (headnpu);
+  \draw[->, thick] (headnpu) -- (strip);
+  \draw[->, thick] (strip) -- (output);
 
-  \node[framebox, fit=(b1)(b2)(dots)(bl), inner xsep=0.42cm, inner ysep=0.42cm,
-        label={[font=\normalsize\bfseries]above:AMD XDNA2 NPU residual conveyor belt}] (bodygroup) {};
+  \node[framebox, fit=(embed)(b1)(b2)(dots)(bl)(headnpu), inner xsep=0.42cm, inner ysep=0.42cm,
+        label={[font=\normalsize\bfseries]above:AMD XDNA2 full-inference conveyor belt}] (bodygroup) {};
   \node[note, anchor=north] at ($(bodygroup.south)+(0,-0.16)$)
-    {hidden activations stream tile-to-tile in snake order};
+    {embed, residual body, and classifier head all stream tile-to-tile in snake order};
 
   \foreach \col in {0,...,7} {
     \pgfmathtruncatemacro{\colnum}{\col + 1}
@@ -90,10 +92,14 @@
       \fi
       \pgfmathsetmacro{\x}{5.45 + \col * 1.0}
       \pgfmathsetmacro{\y}{2.25 - \row * 0.78}
-      \ifnum\blockid<9
+      \ifnum\blockid=1
         \node[tilehot] (tile-\col-\row) at (\x, \y) {\blockid};
       \else
-        \node[tile] (tile-\col-\row) at (\x, \y) {\blockid};
+        \ifnum\blockid=32
+          \node[tilehot] (tile-\col-\row) at (\x, \y) {\blockid};
+        \else
+          \node[tile] (tile-\col-\row) at (\x, \y) {\blockid};
+        \fi
       \fi
     }
     \node[note, anchor=south] at ($(tile-\col-0.north)+(0,0.34)$) {col \colnum};
@@ -111,29 +117,31 @@
   \begin{scope}[on background layer]
     \draw[routegreen, line width=4.2pt, opacity=0.25]
       (tile-0-0.center) -- (tile-0-1.center) -- (tile-0-2.center) -- (tile-0-3.center)
-      -- (tile-1-3.center) -- (tile-1-2.center) -- (tile-1-1.center) -- (tile-1-0.center);
+      -- (tile-1-3.center) -- (tile-1-2.center) -- (tile-1-1.center) -- (tile-1-0.center)
+      -- (tile-2-0.center) -- (tile-2-1.center) -- (tile-2-2.center) -- (tile-2-3.center)
+      -- (tile-3-3.center) -- (tile-3-2.center) -- (tile-3-1.center) -- (tile-3-0.center)
+      -- (tile-4-0.center) -- (tile-4-1.center) -- (tile-4-2.center) -- (tile-4-3.center)
+      -- (tile-5-3.center) -- (tile-5-2.center) -- (tile-5-1.center) -- (tile-5-0.center)
+      -- (tile-6-0.center) -- (tile-6-1.center) -- (tile-6-2.center) -- (tile-6-3.center)
+      -- (tile-7-3.center) -- (tile-7-2.center) -- (tile-7-1.center) -- (tile-7-0.center);
   \end{scope}
 
   \draw[->, thick, npudraw]
     ($(bodygroup.south)+(0,-0.05)$) -- ($(arraygroup.north)+(0,0.08)$);
 
-  \draw[decorate, decoration={brace, mirror, amplitude=5pt}, npudraw]
-    ($(tile-0-3.south west)+(-0.05,-0.17)$) --
-    ($(tile-1-3.south east)+(0.05,-0.17)$)
-    node[midway, below=7pt, align=center, font=\scriptsize] {\textbf{$L=8$ throughput point}\\2 columns = 8 tiles};
-
   \draw[decorate, decoration={brace, mirror, amplitude=7pt}, black!55]
-    ($(tile-0-3.south west)+(-0.05,-0.70)$) --
-    ($(tile-7-3.south east)+(0.05,-0.70)$)
-    node[midway, below=9pt, align=center, font=\scriptsize] {\textbf{$L=32$ deeper body}\\full 8-column array};
+    ($(tile-0-3.south west)+(-0.05,-0.34)$) --
+    ($(tile-7-3.south east)+(0.05,-0.34)$)
+    node[midway, below=9pt, align=center, font=\scriptsize] {\textbf{Retained deployment}\\Tile 1 embed, tiles 2--31 residual body, tile 32 head};
 
   \node[notesbox, anchor=west] at ($(arraygroup.east)+(0.55,-0.02)$) {
     \textbf{Retained paper-path rules}\\
-    $\bullet$ CPU handles the narrow surround; NPU keeps the residual body\\
-    $\bullet$ each compute tile stores one square residual matrix\\
-    $\bullet$ tile numbers are also snake-order block indices\\
+    $\bullet$ all matrix multiplies now run on the NPU\\
+    $\bullet$ tile 1 stores the padded $28 \rightarrow 32$ embed\\
+    $\bullet$ tiles 2--31 store the 30 square residual matrices\\
+    $\bullet$ tile 32 stores the padded $32 \rightarrow 8$ head\\
     $\bullet$ widths and batch sizes stay in multiples of 8\\
-    $\bullet$ dark tiles = fastest $L=8$ body, pale tiles = extra $L=32$ depth
+    $\bullet$ host work is reduced to pad / launch / strip
   };
 \end{tikzpicture}
 \end{document}

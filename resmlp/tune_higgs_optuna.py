@@ -19,7 +19,6 @@ from types import SimpleNamespace
 import mlflow
 import optuna
 from optuna.exceptions import TrialPruned
-from sklearn.metrics import average_precision_score, log_loss, roc_auc_score
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -27,11 +26,13 @@ from torch.utils.data import DataLoader
 from resmlp.data_utils import DEFAULT_SPLIT_SEED, DEFAULT_VAL_SIZE, load_datasets, split_train_val
 from resmlp.model import ResMLP
 from resmlp.train import (
+    ModelEma,
     build_checkpoint,
     build_optimizer,
     build_scheduler,
-    evaluate,
+    compute_selection_score,
     resolve_device,
+    score_classifier,
     set_seed,
     train_epoch,
 )
@@ -56,9 +57,10 @@ def parse_args():
     parser.add_argument("--train-num-workers", type=int, default=4)
     parser.add_argument("--eval-num-workers", type=int, default=4)
     parser.add_argument("--eval-batch-size", type=int, default=32_768)
-    parser.add_argument("--hidden-dims", nargs="+", type=int, default=[32, 64])
-    parser.add_argument("--num-layers-options", nargs="+", type=int, default=[8, 32])
+    parser.add_argument("--hidden-dims", nargs="+", type=int, default=[32])
+    parser.add_argument("--num-layers-options", nargs="+", type=int, default=[30])
     parser.add_argument("--batch-sizes", nargs="+", type=int, default=[4096, 8192])
+    parser.add_argument("--optimizer-choices", nargs="+", default=["adamw"])
     parser.add_argument("--lr-min", type=float, default=1e-3)
     parser.add_argument("--lr-max", type=float, default=4e-3)
     parser.add_argument("--weight-decay-min", type=float, default=1e-5)
@@ -66,10 +68,21 @@ def parse_args():
     parser.add_argument("--min-lr-ratio-min", type=float, default=0.02)
     parser.add_argument("--min-lr-ratio-max", type=float, default=0.2)
     parser.add_argument("--label-smoothing-max", type=float, default=0.05)
+    parser.add_argument("--residual-init-scale-min", type=float, default=0.05)
+    parser.add_argument("--residual-init-scale-max", type=float, default=0.15)
+    parser.add_argument("--warmup-epochs-options", nargs="+", type=int, default=[4, 8])
+    parser.add_argument("--grad-clip-norm-options", nargs="+", type=float, default=[0.0, 1.0])
+    parser.add_argument("--ema-decay-options", nargs="+", type=float, default=[0.0, 0.999])
     parser.add_argument("--allow-residual-bias", action="store_true")
-    parser.add_argument("--prune-after", type=int, default=12)
+    parser.add_argument("--prune-after", type=int, default=20)
+    parser.add_argument("--pruner-startup-trials", type=int, default=8)
     parser.add_argument("--no-prune", action="store_true")
     parser.add_argument("--sampler-seed", type=int, default=1234)
+    parser.add_argument(
+        "--selection-metric",
+        choices=("val_acc", "val_roc_auc", "composite"),
+        default="composite",
+    )
     return parser.parse_args()
 
 
@@ -90,48 +103,27 @@ def build_trial_args(args, params):
         hidden_dim=params["hidden_dim"],
         num_layers=params["num_layers"],
         residual_bias=params["residual_bias"],
+        residual_init_scale=params["residual_init_scale"],
         val_size=args.val_size,
         split_seed=args.split_seed,
         seed=params["seed"],
         train_aug="none",
-        optimizer="adamw",
+        optimizer=params["optimizer"],
         lr=params["lr"],
         weight_decay=params["weight_decay"],
         label_smoothing=params["label_smoothing"],
-        scheduler="cosine",
+        scheduler="warmup_cosine",
         momentum=0.9,
         min_lr=params["min_lr"],
+        warmup_epochs=params["warmup_epochs"],
+        warmup_start_factor=0.1,
+        grad_clip_norm=params["grad_clip_norm"],
+        ema_decay=params["ema_decay"],
+        selection_metric=args.selection_metric,
         batch_size=params["batch_size"],
         epochs=args.max_epochs,
+        npu_batch_size=params["batch_size"],
     )
-
-
-@torch.no_grad()
-def score_classifier(model, loader, device, criterion):
-    model.eval()
-    total_loss, correct, total = 0.0, 0, 0
-    all_probs = []
-    all_labels = []
-    for features, labels in loader:
-        features = features.to(device, non_blocking=True)
-        labels = labels.to(device, non_blocking=True)
-        logits = model(features)
-        loss = criterion(logits, labels)
-        probs = torch.softmax(logits, dim=1)[:, 1]
-        total_loss += loss.item() * labels.size(0)
-        correct += (logits.argmax(1) == labels).sum().item()
-        total += labels.size(0)
-        all_probs.append(probs.cpu())
-        all_labels.append(labels.cpu())
-    probs = torch.cat(all_probs).numpy()
-    labels = torch.cat(all_labels).numpy()
-    return {
-        "loss": total_loss / total,
-        "accuracy": correct / total,
-        "roc_auc": float(roc_auc_score(labels, probs)),
-        "pr_auc": float(average_precision_score(labels, probs)),
-        "log_loss": float(log_loss(labels, probs, labels=[0, 1])),
-    }
 
 
 def make_loader(dataset, *, batch_size, shuffle, num_workers, pin_memory):
@@ -157,6 +149,7 @@ def sample_params(trial, args):
         "hidden_dim": trial.suggest_categorical("hidden_dim", args.hidden_dims),
         "num_layers": trial.suggest_categorical("num_layers", args.num_layers_options),
         "batch_size": trial.suggest_categorical("batch_size", args.batch_sizes),
+        "optimizer": trial.suggest_categorical("optimizer", args.optimizer_choices),
         "lr": lr,
         "weight_decay": trial.suggest_float(
             "weight_decay",
@@ -167,6 +160,14 @@ def sample_params(trial, args):
         "min_lr_ratio": min_lr_ratio,
         "min_lr": max(1e-6, lr * min_lr_ratio),
         "label_smoothing": trial.suggest_float("label_smoothing", 0.0, args.label_smoothing_max),
+        "residual_init_scale": trial.suggest_float(
+            "residual_init_scale",
+            args.residual_init_scale_min,
+            args.residual_init_scale_max,
+        ),
+        "warmup_epochs": trial.suggest_categorical("warmup_epochs", args.warmup_epochs_options),
+        "grad_clip_norm": trial.suggest_categorical("grad_clip_norm", args.grad_clip_norm_options),
+        "ema_decay": trial.suggest_categorical("ema_decay", args.ema_decay_options),
         "residual_bias": trial.suggest_categorical("residual_bias", residual_bias_options),
         "seed": args.seed + trial.number,
     }
@@ -213,12 +214,15 @@ def objective_factory(args, train_ds, val_ds, test_ds, device, save_root):
             input_dim=input_dim,
             num_classes=2,
             residual_bias=params["residual_bias"],
+            residual_init_scale=params["residual_init_scale"],
         ).to(device)
         optimizer = build_optimizer(trial_args, model.parameters())
         scheduler = build_scheduler(trial_args, optimizer)
         criterion = nn.CrossEntropyLoss(label_smoothing=params["label_smoothing"])
+        ema = ModelEma(model, params["ema_decay"]) if params["ema_decay"] > 0 else None
 
-        best_val_acc = float("-inf")
+        best_val_score = float("-inf")
+        best_val_metrics = None
         best_epoch = -1
         best_path = trial_dir / "resmlp_best.pt"
         summary_path = trial_dir / "summary.json"
@@ -240,6 +244,15 @@ def objective_factory(args, train_ds, val_ds, test_ds, device, save_root):
                     "study_name": args.study_name,
                     "trial_number": str(trial.number),
                     "model_family": "resmlp",
+                    "selection_metric": args.selection_metric,
+                    "pruning": "disabled" if args.no_prune else "median",
+                }
+            )
+            mlflow.log_params(
+                {
+                    "prune_after": args.prune_after,
+                    "pruner_startup_trials": args.pruner_startup_trials,
+                    "no_prune": args.no_prune,
                 }
             )
 
@@ -253,8 +266,17 @@ def objective_factory(args, train_ds, val_ds, test_ds, device, save_root):
                     else:
                         start = time.time()
 
-                    train_loss, train_acc = train_epoch(model, train_loader, optimizer, criterion, device)
-                    val_loss, val_acc = evaluate(model, val_loader, criterion, device)
+                    train_loss, train_acc = train_epoch(
+                        model,
+                        train_loader,
+                        optimizer,
+                        criterion,
+                        device,
+                        grad_clip_norm=params["grad_clip_norm"],
+                        ema=ema,
+                    )
+                    eval_model = ema.module if ema is not None else model
+                    val_metrics = score_classifier(eval_model, val_loader, device, criterion)
 
                     if scheduler is not None:
                         scheduler.step()
@@ -273,31 +295,46 @@ def objective_factory(args, train_ds, val_ds, test_ds, device, save_root):
                         {
                             "train_loss": train_loss,
                             "train_acc": train_acc,
-                            "val_loss": val_loss,
-                            "val_acc": val_acc,
+                            "val_loss": val_metrics["loss"],
+                            "val_acc": val_metrics["accuracy"],
+                            "val_roc_auc": val_metrics["roc_auc"],
+                            "val_pr_auc": val_metrics["pr_auc"],
+                            "val_log_loss": val_metrics["log_loss"],
                             "lr": lr,
                             "train_samples_per_sec": samples_per_sec,
                         },
                         step=epoch,
                     )
 
+                    val_score = compute_selection_score(args.selection_metric, val_metrics)
                     checkpoint = build_checkpoint(
-                        trial_args, epoch, model, optimizer, scheduler, "val", val_loss, val_acc
+                        trial_args,
+                        epoch,
+                        model,
+                        optimizer,
+                        scheduler,
+                        "val",
+                        val_metrics,
+                        ema_model=ema.module if ema is not None else None,
                     )
-                    if val_acc > best_val_acc:
-                        best_val_acc = val_acc
+                    if val_score > best_val_score:
+                        best_val_score = val_score
+                        best_val_metrics = dict(val_metrics)
                         best_epoch = epoch
                         torch.save(checkpoint, best_path)
-                        mlflow.log_metric("best_val_acc", best_val_acc, step=epoch)
+                        mlflow.log_metric("best_val_score", best_val_score, step=epoch)
+                        mlflow.log_metric("best_val_acc", val_metrics["accuracy"], step=epoch)
+                        mlflow.log_metric("best_val_roc_auc", val_metrics["roc_auc"], step=epoch)
 
                     if (epoch + 1) % 10 == 0 or epoch == args.max_epochs - 1:
                         torch.save(checkpoint, trial_dir / f"resmlp_epoch{epoch:03d}.pt")
 
-                    trial.report(best_val_acc, step=epoch)
+                    trial.report(best_val_score, step=epoch)
                     if not args.no_prune and epoch + 1 >= args.prune_after and trial.should_prune():
                         payload = {
                             "status": "pruned",
-                            "best_val_acc": best_val_acc,
+                            "best_val_score": best_val_score,
+                            "best_val_metrics": best_val_metrics,
                             "best_epoch": best_epoch,
                             "params": params,
                         }
@@ -313,12 +350,14 @@ def objective_factory(args, train_ds, val_ds, test_ds, device, save_root):
                     input_dim=best_checkpoint["input_dim"],
                     num_classes=best_checkpoint["num_classes"],
                     residual_bias=bool(best_checkpoint.get("residual_bias", False)),
+                    residual_init_scale=best_checkpoint.get("residual_init_scale", 0.1),
                 ).to(device)
                 best_model.load_state_dict(best_checkpoint["model"])
                 test_metrics = score_classifier(best_model, test_loader, device, criterion)
                 payload = {
                     "status": "completed",
-                    "best_val_acc": best_val_acc,
+                    "best_val_score": best_val_score,
+                    "best_val_metrics": best_val_metrics,
                     "best_epoch": best_epoch,
                     "test_metrics": test_metrics,
                     "params": params,
@@ -341,7 +380,7 @@ def objective_factory(args, train_ds, val_ds, test_ds, device, save_root):
                 trial.set_user_attr("best_epoch", best_epoch)
                 trial.set_user_attr("test_accuracy", test_metrics["accuracy"])
                 trial.set_user_attr("test_roc_auc", test_metrics["roc_auc"])
-                return best_val_acc
+                return best_val_score
             except TrialPruned:
                 raise
             except Exception:
@@ -362,32 +401,47 @@ def enqueue_baselines(study, args):
     baseline_trials = [
         {
             "hidden_dim": 32,
-            "num_layers": 32,
+            "num_layers": 30,
             "batch_size": 8192,
+            "optimizer": "adamw",
             "lr": 3e-3,
             "weight_decay": 1e-4,
             "min_lr_ratio": 1 / 30,
             "label_smoothing": 0.0,
+            "residual_init_scale": 0.1,
+            "warmup_epochs": 4,
+            "grad_clip_norm": 0.0,
+            "ema_decay": 0.0,
             "residual_bias": False,
         },
         {
             "hidden_dim": 32,
-            "num_layers": 8,
+            "num_layers": 30,
             "batch_size": 8192,
-            "lr": 3e-3,
-            "weight_decay": 1e-4,
-            "min_lr_ratio": 1 / 30,
-            "label_smoothing": 0.0,
-            "residual_bias": False,
-        },
-        {
-            "hidden_dim": 32,
-            "num_layers": 32,
-            "batch_size": 8192,
+            "optimizer": "adamw",
             "lr": 2e-3,
             "weight_decay": 1e-3,
             "min_lr_ratio": 0.05,
-            "label_smoothing": 0.0,
+            "label_smoothing": 0.02,
+            "residual_init_scale": 0.08,
+            "warmup_epochs": 8,
+            "grad_clip_norm": 1.0,
+            "ema_decay": 0.999,
+            "residual_bias": False,
+        },
+        {
+            "hidden_dim": 32,
+            "num_layers": 30,
+            "batch_size": 4096,
+            "optimizer": "adamw",
+            "lr": 3e-3,
+            "weight_decay": 1e-3,
+            "min_lr_ratio": 0.05,
+            "label_smoothing": 0.01,
+            "residual_init_scale": 0.1,
+            "warmup_epochs": 8,
+            "grad_clip_norm": 1.0,
+            "ema_decay": 0.999,
             "residual_bias": False,
         },
     ]
@@ -399,6 +453,8 @@ def enqueue_baselines(study, args):
             continue
         if params["batch_size"] not in args.batch_sizes:
             continue
+        if params["optimizer"] not in args.optimizer_choices:
+            continue
         if params["residual_bias"] not in residual_bias_options:
             continue
         if not (args.lr_min <= params["lr"] <= args.lr_max):
@@ -408,6 +464,14 @@ def enqueue_baselines(study, args):
         if not (args.min_lr_ratio_min <= params["min_lr_ratio"] <= args.min_lr_ratio_max):
             continue
         if not (0.0 <= params["label_smoothing"] <= args.label_smoothing_max):
+            continue
+        if not (args.residual_init_scale_min <= params["residual_init_scale"] <= args.residual_init_scale_max):
+            continue
+        if params["warmup_epochs"] not in args.warmup_epochs_options:
+            continue
+        if params["grad_clip_norm"] not in args.grad_clip_norm_options:
+            continue
+        if params["ema_decay"] not in args.ema_decay_options:
             continue
         study.enqueue_trial(params, skip_if_exists=True)
 
@@ -457,7 +521,10 @@ def main():
     if args.no_prune:
         pruner = optuna.pruners.NopPruner()
     else:
-        pruner = optuna.pruners.MedianPruner(n_startup_trials=4, n_warmup_steps=args.prune_after)
+        pruner = optuna.pruners.MedianPruner(
+            n_startup_trials=args.pruner_startup_trials,
+            n_warmup_steps=args.prune_after,
+        )
     study = optuna.create_study(
         study_name=args.study_name,
         storage=args.storage,
