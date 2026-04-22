@@ -58,25 +58,23 @@
   \node[basebox, minimum width=2.0cm] (input) at (1.25, 6.9) {HIGGS features\\\textbf{28 floats}};
   \node[cpubox, minimum width=2.45cm] (pad) at (3.9, 6.9) {Host shim\\pad $28 \rightarrow 32$};
   \node[bodybox, minimum width=1.55cm] (embed) at (6.35, 6.9) {Embed\\Tile 1};
-  \node[bodybox, minimum width=1.55cm] (b1) at (8.0, 6.9) {Residual 1\\Tile 2};
-  \node[bodybox, minimum width=1.55cm] (b2) at (9.65, 6.9) {Residual 2\\Tile 3};
-  \node[font=\Large, text=textgray] (dots) at (11.05, 6.9) {$\cdots$};
-  \node[bodybox, minimum width=1.75cm] (bl) at (12.65, 6.9) {Residual 30\\Tile 31};
-  \node[bodybox, minimum width=1.55cm] (headnpu) at (14.55, 6.9) {Head\\Tile 32};
+  \node[bodybox, minimum width=1.55cm] (b1) at (8.55, 6.9) {Residual 1\\Tile 2};
+  \node[font=\Large, text=textgray] (dots) at (10.45, 6.9) {$\cdots$};
+  \node[bodybox, minimum width=1.75cm] (bl) at (12.35, 6.9) {Residual 30\\Tile 31};
+  \node[bodybox, minimum width=1.55cm] (headnpu) at (14.35, 6.9) {Head\\Tile 32};
   \node[cpubox, minimum width=2.25cm] (strip) at (17.0, 6.9) {Host shim\\strip $8 \rightarrow 2$};
   \node[basebox, minimum width=1.9cm] (output) at (19.25, 6.9) {Signal /\\background};
 
-  \draw[->, thick] (input) -- (pad);
-  \draw[->, thick] (pad) -- (embed);
-  \draw[->, thick] (embed) -- (b1);
-  \draw[->, thick] (b1) -- (b2);
-  \draw[->, thick] (b2) -- (dots);
-  \draw[->, thick] (dots) -- (bl);
-  \draw[->, thick] (bl) -- (headnpu);
-  \draw[->, thick] (headnpu) -- (strip);
-  \draw[->, thick] (strip) -- (output);
+  \draw[->, thick, shorten <=1pt, shorten >=1pt] (input.east) -- (pad.west);
+  \draw[->, thick, shorten <=1pt, shorten >=1pt] (pad.east) -- (embed.west);
+  \draw[->, thick, shorten <=1pt, shorten >=2pt] (embed.east) -- (b1.west);
+  \draw[->, thick, shorten <=2pt, shorten >=1pt] (b1.east) -- (dots.west);
+  \draw[->, thick, shorten <=1pt, shorten >=2pt] (dots.east) -- (bl.west);
+  \draw[->, thick, shorten <=1pt, shorten >=2pt] (bl.east) -- (headnpu.west);
+  \draw[->, thick, shorten <=1pt, shorten >=1pt] (headnpu.east) -- (strip.west);
+  \draw[->, thick, shorten <=1pt, shorten >=1pt] (strip.east) -- (output.west);
 
-  \node[framebox, fit=(embed)(b1)(b2)(dots)(bl)(headnpu), inner xsep=0.42cm, inner ysep=0.42cm,
+  \node[framebox, fit=(embed)(b1)(dots)(bl)(headnpu), inner xsep=0.42cm, inner ysep=0.42cm,
         label={[font=\normalsize\bfseries]above:AMD XDNA2 full-inference conveyor belt}] (bodygroup) {};
   \node[note, anchor=north] at ($(bodygroup.south)+(0,-0.16)$)
     {embed, residual body, and classifier head all stream tile-to-tile in snake order};

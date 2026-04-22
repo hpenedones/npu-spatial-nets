@@ -46,10 +46,10 @@ low-latency inference on dense collider-style features? We answer it with a
 forward-only residual multilayer perceptron (MLP) whose input projection, 30
 residual blocks, and classifier head stream across the 32 compute tiles of the
 Strix Point array. On the public HIGGS benchmark, this fully on-array
-$H=32$, $L=30$ pipeline reaches 76.61\% test accuracy and sustains 14.08M
-samples/s wall-clock at batch size 64 on the fixed 500k-example test split, or
-2.44M samples/s at the native streaming batch of 8. On the same machine and the
-same model, a 12-core CPU baseline peaks at 0.98M samples/s, so the on-array
+$H=32$, $L=30$ pipeline reaches 77.31\% test accuracy and sustains 14.08M
+samples/s wall-clock at batch size 64 on the fixed 500k-example test split. On
+the same machine and the same model, a 12-core CPU baseline peaks at
+0.98M samples/s, so the on-array
 path is about $14\times$ faster. The contribution is a measured co-designed
 operating regime on consumer hardware, not a production trigger deployment, a
 state-of-the-art HIGGS accuracy result, or an energy-efficiency study.
@@ -71,7 +71,8 @@ but which model maps cleanly to many small memories connected by streams.
 The focus here is deliberately narrow: one residual MLP for HIGGS, with one
 residual matrix per tile and a forward-only spatial-streaming deployment on the
 NPU. The aim is not to survey every model family or every use of XDNA~2, but to
-isolate one design that can be understood end to end.
+isolate one design that can be understood end to end on an off-the-shelf mini
+PC that costs roughly US\$1000.
 
 HIGGS is a natural benchmark for this study. It is a dense 28-feature binary
 classification task derived from collider events, introduced by Baldi,
@@ -84,10 +85,8 @@ bunch-crossing rate, produce decisions with a latency budget of about
 12.5~$\mu$s, and emit accepted events at roughly 750~kHz
 \cite{cms-phase2-l1}. Those rates explain why multi-megasample-per-second
 measurements are interesting here, but they do not imply deployment
-equivalence: the best wall-clock result in this paper is 14.08M samples/s at
-$B=64$ on a fully on-array $H=32$, $L=30$ path. The point is to study the same
-systems regime of dense features, strict latency sensitivity, and pressure for
-very high sustained throughput.
+equivalence. The point is to study the same systems regime of dense features,
+strict latency sensitivity, and pressure for very high sustained throughput.
 
 This places the paper next to three adjacent literatures. On HIGGS itself, the
 reference landscape includes the original deep-versus-classic framing, strong
@@ -188,31 +187,10 @@ the output columns.}
 
 The important design choice is not just ``use an MLP'', but ``use an MLP whose
 depth and width map directly to the array's tile structure''. That keeps the design
-simple enough to analyze and direct enough to deploy.
-
-\section{From Python model to NPU artifact}
-
-The toolchain is deliberately short. \path{aie_kernels/matmul_relu_skip.cc}
-defines the tile-local residual kernel, while
-\path{aie_kernels/matmul_bias.cc} is compiled twice for the embed and head
-linear stages. \path{resmlp/streaming_design.py} turns a chosen $(H, B, L)$
-shape into a spatial-streaming MLIR-AIE (Multi-Level Intermediate
-Representation for AI Engine) program that wires embed, residual
-body, and head into one snake. \path{resmlp/streaming_op.py} wraps the compiled
-device image and instruction binary as a resident XRT operator. Finally,
-\path{resmlp/streaming_infer.py} drives trained checkpoints through that
-operator and measures wall-clock throughput.
-
-The novelty claimed here is not a new compiler or runtime. IRON and MLIR-AIE
-already provide that substrate \cite{iron,mlir-aie}. What is new is the
-model-to-array mapping, the host/NPU partition, and the end-to-end measurements
-of that co-designed path on real HIGGS checkpoints.
-
-A key detail of the current forward path is that the residual weights are
-embedded at compile time. Each throughput run therefore builds a
-checkpoint-specific streaming artifact. That is not the most general
-deployment contract. It is, however, the cleanest way to study the geometry,
-routing, and wall-clock behavior of a resident spatial-streaming design.
+simple enough to analyze and direct enough to deploy. The software path from the
+PyTorch checkpoint to the resident NPU artifact is short enough to summarize in
+one appendix section rather than carrying those mechanics through the main
+systems narrative; see Appendix~\ref{app:python-to-artifact}.
 
 \section{Training protocol on HIGGS}
 
@@ -243,13 +221,17 @@ actually exploit''.
 Model & Training recipe \\
 \midrule
 $H=32$, $L=30$ full-NPU &
-9 epochs on the AMD Radeon 890M Radeon Open Compute (ROCm) path; AdamW, batch 8192, cosine
-$3\times10^{-3} \rightarrow 10^{-4}$, weight decay $10^{-4}$, no label
-smoothing. Early-stopping plateau on held-out validation. \\
+best trial from a fair 20-epoch no-prune Optuna study on the AMD Radeon 890M
+Radeon Open Compute (ROCm) path; AdamW, batch 8192, warmup-cosine
+$2\times10^{-3} \rightarrow 10^{-4}$, weight decay $10^{-3}$, label smoothing
+0.02, residual-init scale 0.08, gradient clipping 1.0, exponential moving
+average 0.999. Checkpoint selection uses the validation composite score
+$(\mathrm{ROC\ AUC} + 10^{-3}\!\times\!\mathrm{accuracy})$, with the best model
+arriving at epoch 19. \\
 \bottomrule
 \end{tabularx}
-\caption{Training recipe for the retained $H=32$, $L=30$ checkpoint that the
-on-array deployment uses end to end.}
+\caption{Training recipe for the current best same-architecture $H=32$, $L=30$
+checkpoint.}
 \label{tab:training-protocol}
 \end{table}
 
@@ -259,10 +241,37 @@ on-array deployment uses end to end.}
 
 Table~\ref{tab:higgs-full-results} reports test accuracy, receiver operating
 characteristic area under the curve (ROC AUC), precision-recall area under the
-curve (PR AUC), and log loss for the retained checkpoint. The key point is that
-the systems design is not accuracy-indifferent: this hardware-friendly residual
-MLP still becomes a credible classifier once trained on the full public HIGGS
-data.
+curve (PR AUC), and log loss for the best same-architecture checkpoint found so
+far. The key point is that the systems design is not accuracy-indifferent: this
+hardware-friendly residual MLP still becomes a credible classifier once trained
+on the full public HIGGS data.
+
+\begin{table}[t]
+\centering
+\footnotesize
+\begin{tabularx}{\textwidth}{@{}lXcc@{}}
+\toprule
+Reference & Model & Test ROC AUC & Approx.\ parameters \\
+\midrule
+Baldi et al.~\cite{baldi-higgs} & shallow neural network & 0.8620 & $\sim$9k \\
+Baldi et al.~\cite{baldi-higgs} & boosted decision trees & 0.8771 & n/a \\
+Baldi et al.~\cite{baldi-higgs} & deep neural network (ensemble of 5) & 0.8807 & $\sim$1.85M \\
+Grinsztajn et al.~\cite{grinsztajn-tabular} & multilayer perceptron & 0.836 & tuned / not fixed \\
+Grinsztajn et al.~\cite{grinsztajn-tabular} & NODE & 0.851 & tuned / not fixed \\
+Grinsztajn et al.~\cite{grinsztajn-tabular} & CatBoost / LightGBM & 0.852 & n/a \\
+This work & full-NPU residual MLP ($H=32$, $L=30$) & 0.8578 & 31.7k \\
+\bottomrule
+\end{tabularx}
+\caption{Reported HIGGS test ROC AUC from representative cited papers, plus the
+retained result in this work. Cross-paper protocol details differ, so this
+table is best read as a landscape rather than as a strict leaderboard. The
+useful comparison is that the deployed model lands well above simple generic
+MLPs and close to strong modern tabular baselines, while remaining below the
+large specialized HIGGS models of Baldi et al. Parameter counts are
+order-of-magnitude only; for benchmark families that do not fix one architecture
+in the cited result, the count is marked as not directly comparable.}
+\label{tab:higgs-literature}
+\end{table}
 
 \begin{table}[t]
 \centering
@@ -271,20 +280,21 @@ data.
 \toprule
 Model & Test acc. & ROC AUC & PR AUC & Log loss \\
 \midrule
-$H=32$, $L=30$ full-NPU & 76.61\% & 0.8507 & 0.8635 & 0.4759 \\
+$H=32$, $L=30$ full-NPU & 77.31\% & 0.8578 & 0.8700 & 0.4654 \\
 \bottomrule
 \end{tabular}
-\caption{Full-data HIGGS results for the retained $H=32$, $L=30$ checkpoint on
-the public \code{jxie/higgs} mirror, evaluated on the fixed 500k-example test
-split.}
+\caption{Full-data HIGGS results for the best same-architecture $H=32$, $L=30$
+checkpoint on the public \code{jxie/higgs} mirror, evaluated on the fixed
+500k-example test split.}
 \label{tab:higgs-full-results}
 \end{table}
 
-The retained checkpoint reaches 0.851 ROC AUC on the 500k-example test split.
-That is not a claim of state-of-the-art HIGGS accuracy, but it is well inside
-the credible baseline band reported by
-\cite{baldi-higgs,rtdl-revisiting,grinsztajn-tabular} for comparably sized
-dense models.
+The best same-architecture checkpoint reaches 0.858 ROC AUC on the
+500k-example test split.
+That is not a claim of state-of-the-art HIGGS accuracy, but it is comfortably
+inside the credible range for modern tabular baselines and well above the
+generic-MLP numbers in the standardized Grinsztajn et al. benchmark
+\cite{baldi-higgs,grinsztajn-tabular}.
 
 \subsection{Throughput of the spatial-streaming deployment}
 
@@ -319,6 +329,30 @@ an earlier serial host loop left wall throughput far below the kernel ceiling,
 and moving the embed and head stages on-array only helped once host overhead
 had already been amortized. Appendix~\ref{app:path-to-14M} summarizes that
 optimization path.
+
+\begin{table}[t]
+\centering
+\footnotesize
+\begin{tabularx}{\textwidth}{@{}>{\raggedright\arraybackslash}p{0.15\textwidth}>{\raggedright\arraybackslash}p{0.2\textwidth}X>{\raggedleft\arraybackslash}p{0.13\textwidth}>{\raggedleft\arraybackslash}p{0.1\textwidth}>{\raggedleft\arraybackslash}p{0.12\textwidth}@{}}
+\toprule
+Reference & Hardware & Model architecture & Samples/s & Latency & Price estimate (USD) \\
+\midrule
+This work & AMD Ryzen AI 9 HX 370 mini PC & full $H=32$, $L=30$ residual MLP on HIGGS & 14.08M & --- & \(\sim\$1{,}000\) \\
+Duarte et al.~\cite{duarte-fpga} & Xilinx KU115 FPGA board & small fully connected trigger network & 13M & 75 ns & \(\sim\$13{,}000\) \\
+Duarte et al.~\cite{duarte-fpga} & Intel Arria 10 GX1150 FPGA board & same benchmark network & 11M & 74 ns & \(\sim\$10{,}000\) \\
+Duarte et al.~\cite{duarte-fpga} & Xilinx ZC706 FPGA board & same benchmark network & 17M & 57 ns & \(\sim\$3{,}500\) \\
+CMS Phase-2 trigger context~\cite{cms-phase2-l1} & CMS Level-1 trigger system & distributed online event-selection pipeline & 40M input / 0.75M accept & \(\sim\)12.5 \(\mu\)s & n/a \\
+\bottomrule
+\end{tabularx}
+\caption{Representative reported rates from related literature, with hardware
+context. These rows are not directly comparable: the models, precision, and
+deployment objectives differ, and the FPGA papers emphasize latency-first
+streaming trigger deployments rather than large-batch wall throughput. The
+table is included only to situate the 14.08M-samples/s result in the broader
+real-time inference literature. Price estimates are rough 2026 system or
+development-board costs, included only to give order-of-magnitude context.}
+\label{tab:related-throughput}
+\end{table}
 
 \subsection{CPU throughput baseline}
 
@@ -402,9 +436,9 @@ The claim is deliberately narrow but defensible.
         0.98M~samples/s, so moving the full pipeline onto the on-die array
         yields roughly a $14\times$ throughput advantage without any change in
         compute substrate.
-  \item The same design reaches 76.61\% test accuracy and 0.851 ROC AUC on the
-        fixed 500k-example test split, enough to place it inside the credible
-        HIGGS baseline band rather than leaving accuracy as a loose end.
+  \item The same design reaches 77.31\% test accuracy and 0.858 ROC AUC on the
+        fixed 500k-example test split, enough to place it near strong modern
+        tabular baselines rather than leaving accuracy as a loose end.
 \end{itemize}
 
 Just as importantly, the paper avoids claims it does not need. It does not
@@ -421,7 +455,7 @@ XDNA~2 can deliver unusually high throughput on real dense-event
 classification while remaining small enough to understand and validate end to
 end. The retained model is a fully on-array $H=32$, $L=30$ residual MLP that
 sustains 14.08M~samples/s at $B=64$, stays within 1\% of its own kernel
-ceiling, and reaches a credible 76.61\% test accuracy.
+ceiling, and reaches a credible 77.31\% test accuracy.
 
 The next steps are correspondingly focused. The most direct modeling lever is
 to push the on-array model harder on accuracy: longer training schedules,
@@ -553,9 +587,35 @@ that turns the 2.44M samples/s figure into 14.08M samples/s, because at $B=8$
 the retained pipeline is already within 1\% of kernel-limited and the only way
 to go faster is to move the kernel-time ceiling itself.
 
-None of these steps change the learned model: the same 76.61\%-accuracy
-checkpoint is used throughout. They change the artifact that is actually
-dispatched and the way it is dispatched.
+None of these steps change the deployed graph shape. They change the artifact
+that is actually dispatched and the way it is dispatched.
+
+\FloatBarrier
+\clearpage
+\section{From Python model to NPU artifact}
+\label{app:python-to-artifact}
+
+The toolchain is deliberately short. \path{aie_kernels/matmul_relu_skip.cc}
+defines the tile-local residual kernel, while
+\path{aie_kernels/matmul_bias.cc} is compiled twice for the embed and head
+linear stages. \path{resmlp/streaming_design.py} turns a chosen $(H, B, L)$
+shape into a spatial-streaming MLIR-AIE (Multi-Level Intermediate
+Representation for AI Engine) program that wires embed, residual
+body, and head into one snake. \path{resmlp/streaming_op.py} wraps the compiled
+device image and instruction binary as a resident XRT operator. Finally,
+\path{resmlp/streaming_infer.py} drives trained checkpoints through that
+operator and measures wall-clock throughput.
+
+The novelty claimed here is not a new compiler or runtime. IRON and MLIR-AIE
+already provide that substrate \cite{iron,mlir-aie}. What is new is the
+model-to-array mapping, the host/NPU partition, and the end-to-end measurements
+of that co-designed path on real HIGGS checkpoints.
+
+A key detail of the current forward path is that the residual weights are
+embedded at compile time. Each throughput run therefore builds a
+checkpoint-specific streaming artifact. That is not the most general
+deployment contract. It is, however, the cleanest way to study the geometry,
+routing, and wall-clock behavior of a resident spatial-streaming design.
 
 \FloatBarrier
 \clearpage
